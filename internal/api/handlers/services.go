@@ -74,6 +74,63 @@ func validAlias(s string) bool {
 	return validAliasRe.MatchString(s)
 }
 
+// validateTokenEndpoint checks that an OAuth token (or device-code) URL is
+// safe to dial: parseable, https-only (or http for localhost dev), and not
+// using userinfo or a fragment. IP-level SSRF checks happen at connect time
+// in ssrfSafeOAuthClient's DialContext, which prevents DNS rebinding while
+// still allowing the loopback exemption documented below.
+func validateTokenEndpoint(raw string) error {
+	if raw == "" {
+		return fmt.Errorf("token_url is empty")
+	}
+	u, err := url.Parse(raw)
+	if err != nil {
+		return fmt.Errorf("token_url is not a valid URL: %w", err)
+	}
+	if u.Host == "" {
+		return fmt.Errorf("token_url is missing a host")
+	}
+	if u.User != nil {
+		return fmt.Errorf("token_url must not embed userinfo")
+	}
+	if u.Scheme == "https" {
+		return nil
+	}
+	if u.Scheme == "http" {
+		host := u.Hostname()
+		if host == "localhost" || host == "127.0.0.1" || host == "::1" {
+			return nil
+		}
+		return fmt.Errorf("token_url must use https (http only allowed for localhost)")
+	}
+	return fmt.Errorf("token_url must use http or https (got %q)", u.Scheme)
+}
+
+// checkPendingRequestOwnership verifies that pendingReqID — if non-empty —
+// belongs to userID before it gets stashed in OAuth state. Without this an
+// attacker who knows another user's pending_request_id could pass it on the
+// OAuth init step; the OAuth flow would then reactivate that pending request
+// under the attacker's freshly minted credential when the callback completes.
+// reactivatePendingRequest re-checks ownership at callback time as defense in
+// depth, but this helper is the upstream guard. Returns true on success;
+// returns false (and writes the HTTP error) on any failure.
+func (h *ServicesHandler) checkPendingRequestOwnership(w http.ResponseWriter, r *http.Request, userID, pendingReqID string) bool {
+	if pendingReqID == "" {
+		return true
+	}
+	pa, err := h.st.GetPendingApproval(r.Context(), pendingReqID)
+	if err != nil || pa.UserID != userID {
+		h.logger.Warn("rejected oauth init with cross-user pending_request_id",
+			"caller_user_id", userID,
+			"pending_request_id", pendingReqID,
+			"err", err,
+		)
+		writeError(w, http.StatusForbidden, "FORBIDDEN", "pending_request_id does not belong to this user")
+		return false
+	}
+	return true
+}
+
 // validateCLICallback checks that a CLI callback URL is safe — it must be
 // http-only and point to localhost or 127.0.0.1. Returns "" if invalid.
 func validateCLICallback(raw string) string {
@@ -405,12 +462,17 @@ func (h *ServicesHandler) OAuthGetURL(w http.ResponseWriter, r *http.Request) {
 		_ = json.Unmarshal([]byte(raw), &flowConfig)
 	}
 
+	pendingReqID := r.URL.Query().Get("pending_request_id")
+	if !h.checkPendingRequestOwnership(w, r, user.ID, pendingReqID) {
+		return
+	}
+
 	stateToken := uuid.New().String()
 	h.oauthStore.StoreOAuth(stateToken, oauthStateEntry{
 		UserID:       user.ID,
 		ServiceID:    serviceID,
 		Alias:        alias,
-		PendingReqID: r.URL.Query().Get("pending_request_id"),
+		PendingReqID: pendingReqID,
 		CLICallback:  validateCLICallback(r.URL.Query().Get("cli_callback")),
 		Config:       flowConfig,
 		Scopes:       mergedScopes,
@@ -471,12 +533,17 @@ func (h *ServicesHandler) OAuthStart(w http.ResponseWriter, r *http.Request) {
 		_ = json.Unmarshal([]byte(raw), &flowConfig)
 	}
 
+	pendingReqID := r.URL.Query().Get("pending_request_id")
+	if !h.checkPendingRequestOwnership(w, r, user.ID, pendingReqID) {
+		return
+	}
+
 	stateToken := uuid.New().String()
 	h.oauthStore.StoreOAuth(stateToken, oauthStateEntry{
 		UserID:       user.ID,
 		ServiceID:    serviceID,
 		Alias:        alias,
-		PendingReqID: r.URL.Query().Get("pending_request_id"),
+		PendingReqID: pendingReqID,
 		Config:       flowConfig,
 		Scopes:       mergedScopes,
 		TokenPath:    adapterTokenPath(adapter),
@@ -541,6 +608,11 @@ func (h *ServicesHandler) OAuthCallback(w http.ResponseWriter, r *http.Request) 
 			"redirect_uri":  {oauthCfg.RedirectURL},
 			"grant_type":    {"authorization_code"},
 		}
+		if err := validateTokenEndpoint(oauthCfg.Endpoint.TokenURL); err != nil {
+			h.logger.Warn("oauth token exchange: invalid token_url", "service", entry.ServiceID, "err", err)
+			oauthPopupClose(w, "Provider token endpoint is not allowed.", "")
+			return
+		}
 		tokenReq, err := http.NewRequestWithContext(r.Context(), "POST", oauthCfg.Endpoint.TokenURL, strings.NewReader(form.Encode()))
 		if err != nil {
 			oauthPopupClose(w, "Failed to build token request.", "")
@@ -549,7 +621,7 @@ func (h *ServicesHandler) OAuthCallback(w http.ResponseWriter, r *http.Request) 
 		tokenReq.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 		tokenReq.Header.Set("Accept", "application/json")
 
-		resp, err := http.DefaultClient.Do(tokenReq)
+		resp, err := ssrfSafeOAuthClient.Do(tokenReq)
 		if err != nil {
 			h.logger.Warn("oauth token exchange failed", "service", entry.ServiceID, "err", err)
 			oauthPopupClose(w, "Token exchange with provider failed.", "")
@@ -589,8 +661,14 @@ func (h *ServicesHandler) OAuthCallback(w http.ResponseWriter, r *http.Request) 
 			return
 		}
 	} else {
-		// Standard OAuth2 token exchange.
-		token, err := oauthCfg.Exchange(r.Context(), code)
+		// Standard OAuth2 token exchange — route through the SSRF-safe client.
+		if err := validateTokenEndpoint(oauthCfg.Endpoint.TokenURL); err != nil {
+			h.logger.Warn("oauth token exchange: invalid token_url", "service", entry.ServiceID, "err", err)
+			oauthPopupClose(w, "Provider token endpoint is not allowed.", "")
+			return
+		}
+		exchangeCtx := context.WithValue(r.Context(), oauth2.HTTPClient, ssrfSafeOAuthClient)
+		token, err := oauthCfg.Exchange(exchangeCtx, code)
 		if err != nil {
 			h.logger.Warn("oauth token exchange failed", "service", entry.ServiceID, "err", err)
 			oauthPopupClose(w, "Token exchange with provider failed.", "")
@@ -738,6 +816,10 @@ func (h *ServicesHandler) Activate(w http.ResponseWriter, r *http.Request) {
 		}
 		if !validAlias(alias) {
 			writeError(w, http.StatusBadRequest, "INVALID_REQUEST", "alias contains invalid characters (allowed: a-z, A-Z, 0-9, _, -, ., @, +)")
+			return
+		}
+
+		if !h.checkPendingRequestOwnership(w, r, user.ID, body.PendingRequestID) {
 			return
 		}
 
@@ -1175,6 +1257,17 @@ func (h *ServicesHandler) reactivatePendingRequest(ctx context.Context, userID, 
 		h.logger.Warn("reactivate: pending approval not found", "request_id", requestID, "err", err)
 		return
 	}
+	// Defense in depth: even though OAuth init verifies ownership before
+	// stashing the request_id, refuse to act on a pending approval that does
+	// not belong to the user whose OAuth flow we just completed.
+	if pa.UserID != userID {
+		h.logger.Warn("reactivate: refusing cross-user pending approval",
+			"request_id", requestID,
+			"oauth_user_id", userID,
+			"pending_user_id", pa.UserID,
+		)
+		return
+	}
 
 	var blob pendingRequestBlob
 	if err := json.Unmarshal(pa.RequestBlob, &blob); err != nil {
@@ -1446,6 +1539,11 @@ func (h *ServicesHandler) DeviceFlowStart(w http.ResponseWriter, r *http.Request
 		"client_id": {clientID},
 		"scope":     {strings.Join(dfCfg.Scopes, " ")},
 	}
+	if err := validateTokenEndpoint(dfCfg.DeviceCodeURL); err != nil {
+		h.logger.Warn("device flow: invalid device_code_url", "service", serviceID, "err", err)
+		writeError(w, http.StatusBadRequest, "INVALID_REQUEST", "device_code_url is not allowed")
+		return
+	}
 	req, err := http.NewRequestWithContext(r.Context(), "POST", dfCfg.DeviceCodeURL, strings.NewReader(form.Encode()))
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "INTERNAL_ERROR", "failed to build request")
@@ -1454,7 +1552,7 @@ func (h *ServicesHandler) DeviceFlowStart(w http.ResponseWriter, r *http.Request
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	req.Header.Set("Accept", "application/json")
 
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := ssrfSafeOAuthClient.Do(req)
 	if err != nil {
 		h.logger.Warn("device flow: request to provider failed", "err", err)
 		writeError(w, http.StatusBadGateway, "PROVIDER_ERROR", "failed to contact provider")
@@ -1559,6 +1657,11 @@ func (h *ServicesHandler) DeviceFlowPoll(w http.ResponseWriter, r *http.Request)
 		"device_code": {entry.DeviceCode},
 		"grant_type":  {entry.GrantType},
 	}
+	if err := validateTokenEndpoint(entry.TokenURL); err != nil {
+		h.logger.Warn("device flow poll: invalid token_url", "service", entry.ServiceID, "err", err)
+		writeError(w, http.StatusBadRequest, "INVALID_REQUEST", "token_url is not allowed")
+		return
+	}
 	req, err := http.NewRequestWithContext(r.Context(), "POST", entry.TokenURL, strings.NewReader(form.Encode()))
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "INTERNAL_ERROR", "failed to build request")
@@ -1567,7 +1670,7 @@ func (h *ServicesHandler) DeviceFlowPoll(w http.ResponseWriter, r *http.Request)
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	req.Header.Set("Accept", "application/json")
 
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := ssrfSafeOAuthClient.Do(req)
 	if err != nil {
 		h.logger.Warn("device flow poll: request failed", "err", err)
 		writeError(w, http.StatusBadGateway, "PROVIDER_ERROR", "failed to contact provider")
@@ -1862,6 +1965,11 @@ func (h *ServicesHandler) PKCEFlowCallback(w http.ResponseWriter, r *http.Reques
 		"redirect_uri":  {entry.RedirectURI},
 		"grant_type":    {"authorization_code"},
 	}
+	if err := validateTokenEndpoint(entry.TokenURL); err != nil {
+		h.logger.Warn("pkce flow: invalid token_url", "service", entry.ServiceID, "err", err)
+		oauthPopupClose(w, "Provider token endpoint is not allowed.", "")
+		return
+	}
 	tokenReq, err := http.NewRequestWithContext(r.Context(), "POST", entry.TokenURL, strings.NewReader(form.Encode()))
 	if err != nil {
 		oauthPopupClose(w, "Failed to build token request.", "")
@@ -1870,7 +1978,7 @@ func (h *ServicesHandler) PKCEFlowCallback(w http.ResponseWriter, r *http.Reques
 	tokenReq.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	tokenReq.Header.Set("Accept", "application/json")
 
-	resp, err := http.DefaultClient.Do(tokenReq)
+	resp, err := ssrfSafeOAuthClient.Do(tokenReq)
 	if err != nil {
 		h.logger.Warn("pkce flow: token exchange failed", "err", err)
 		oauthPopupClose(w, "Failed to contact token endpoint.", "")
