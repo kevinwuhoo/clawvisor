@@ -8,6 +8,34 @@ import (
 	"github.com/clawvisor/clawvisor/pkg/store"
 )
 
+func TestExtractFirstJSONValue(t *testing.T) {
+	cases := []struct {
+		name string
+		in   string
+		want string
+	}{
+		{"plain object", `{"a":1}`, `{"a":1}`},
+		{"plain array", `[1,2,3]`, `[1,2,3]`},
+		{"json fence wrapper", "```json\n{\"a\":1}\n```", `{"a":1}`},
+		{"bare fence wrapper", "```\n{\"a\":1}\n```", `{"a":1}`},
+		{"trailing prose", "{\"a\":1}\n\nNote: this is the result.", `{"a":1}`},
+		{"leading prose", "Here you go:\n{\"a\":1}", `{"a":1}`},
+		{"fence + trailing prose", "```json\n{\"a\":1}\n```\n\nLet me know.", `{"a":1}`},
+		{"nested braces in string", `{"q":"a {b} c","d":1}`, `{"q":"a {b} c","d":1}`},
+		{"escaped quote in string", `{"q":"\"hi\"","d":1}`, `{"q":"\"hi\"","d":1}`},
+		{"no json at all", "Sorry, I can't help with that.", ""},
+		{"unterminated object", `{"a":1`, ""},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got := extractFirstJSONValue(c.in)
+			if got != c.want {
+				t.Errorf("got %q, want %q", got, c.want)
+			}
+		})
+	}
+}
+
 func TestParseExtractionResponse_NewFormat(t *testing.T) {
 	raw := `{"facts": [{"fact_type": "email_address", "fact_value": "alice@co.com"}], "patterns": [{"fact_type": "email_address", "regex": "\"email\":\\s*\"([^\"]+)\""}]}`
 	facts, patterns := parseExtractionResponse(raw, slog.Default(), "test")
@@ -152,6 +180,50 @@ func TestBuiltinPatterns_Drive(t *testing.T) {
 	}
 	if !found["email_address|bob@co.com"] {
 		t.Error("expected email_address bob@co.com")
+	}
+}
+
+func TestBuiltinPatterns_Calendar(t *testing.T) {
+	patterns := builtinPatterns("google.calendar", "list_events")
+	// list_events response with a mix of plain, leading-underscore, and
+	// recurring-instance event IDs — exactly the shape that triggered the
+	// chain-context miss in production.
+	result := `{"data":[
+		{"id":"1pj4096shhq40g6hkl995jrqfo","summary":"a"},
+		{"id":"_c9gn8or8bsrjedpp81h6urrbcpgm6p9ef5hmurb2d5n62t3fe8n66rrd","summary":"b"},
+		{"id":"0k17pu3tvj4mmvfg7k4jlh9ivg_20260511T010000Z","summary":"c"}]}`
+	matches := runExtractionPatterns(patterns, result, slog.Default(), "test")
+
+	found := make(map[string]bool)
+	for _, m := range matches {
+		found[m.factType+"|"+m.factValue] = true
+	}
+	for _, want := range []string{
+		"event_id|1pj4096shhq40g6hkl995jrqfo",
+		"event_id|_c9gn8or8bsrjedpp81h6urrbcpgm6p9ef5hmurb2d5n62t3fe8n66rrd",
+		"event_id|0k17pu3tvj4mmvfg7k4jlh9ivg_20260511T010000Z",
+	} {
+		if !found[want] {
+			t.Errorf("missing expected match: %s", want)
+		}
+	}
+}
+
+func TestBuiltinPatterns_GenericEntityIDFallback(t *testing.T) {
+	// Unknown service: the cross-service generic block should still emit an
+	// entity_id pattern that catches any "id" field with an 8+ char value.
+	patterns := builtinPatterns("some.new.saas", "list_things")
+	result := `{"things":[{"id":"thing_abc12345"},{"id":"42"}]}`
+	matches := runExtractionPatterns(patterns, result, slog.Default(), "test")
+	found := make(map[string]bool)
+	for _, m := range matches {
+		found[m.factType+"|"+m.factValue] = true
+	}
+	if !found["entity_id|thing_abc12345"] {
+		t.Error("expected entity_id thing_abc12345 from generic fallback")
+	}
+	if found["entity_id|42"] {
+		t.Error("entity_id 42 should NOT be captured (under 8-char minimum)")
 	}
 }
 
@@ -318,11 +390,16 @@ func TestMergeExtractionResults_SubstringValidationDrops(t *testing.T) {
 }
 
 func TestMergeExtractionResults_CapsAtMaxExtractedFacts(t *testing.T) {
-	// Generate a result with 60 distinct message IDs — more than the 50
-	// fact cap. The final list is truncated to maxExtractedFacts.
+	// Generate maxExtractedFacts+10 distinct IDs — the runtime per-pattern
+	// cap (maxRegexMatches) must be at least this large. The final list is
+	// truncated to maxExtractedFacts; extras silently drop.
+	n := maxExtractedFacts + 10
+	if n > maxRegexMatches {
+		t.Skipf("test setup needs maxRegexMatches (%d) >= maxExtractedFacts+10 (%d)", maxRegexMatches, n)
+	}
 	var result []byte
 	result = append(result, []byte(`{"messages":[`)...)
-	for i := 0; i < 60; i++ {
+	for i := 0; i < n; i++ {
 		if i > 0 {
 			result = append(result, ',')
 		}
@@ -336,9 +413,6 @@ func TestMergeExtractionResults_CapsAtMaxExtractedFacts(t *testing.T) {
 	}
 
 	facts, _ := mergeExtractionResults(nil, patterns, makeMergeReq(string(result)), slog.Default())
-	if len(facts) > maxExtractedFacts {
-		t.Errorf("expected at most %d facts, got %d", maxExtractedFacts, len(facts))
-	}
 	if len(facts) != maxExtractedFacts {
 		t.Errorf("expected exactly %d facts at the cap, got %d", maxExtractedFacts, len(facts))
 	}
