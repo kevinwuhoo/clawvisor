@@ -61,6 +61,18 @@ func TruncateSlice[T any](items []T, max int) []T {
 	return items[:max]
 }
 
+// Truncate returns a string truncated to max characters with "..." appended if truncated.
+func Truncate(s string, max int) string {
+	if max <= 0 {
+		return s
+	}
+	if utf8.RuneCountInString(s) > max {
+		runes := []rune(s)
+		return string(runes[:max]) + "..."
+	}
+	return s
+}
+
 // StripSecrets removes keys that look like credentials from a map.
 // Operates on a shallow copy — does not modify the original.
 func StripSecrets(m map[string]any) map[string]any {

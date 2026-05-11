@@ -32,7 +32,10 @@ func TestLoadEmbeddedDefinitions(t *testing.T) {
 		"dropbox":          false,
 		"granola":          false,
 		"perplexity":       false,
+		"microsoft.onedrive": false,
+		"microsoft.outlook":  false,
 	}
+
 
 	for _, a := range adapters {
 		id := a.ServiceID()
