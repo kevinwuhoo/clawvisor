@@ -403,18 +403,28 @@ func (s *Store) UpdateAgentDescription(ctx context.Context, agentID, userID, des
 	return nil
 }
 
+// GetAgent looks up an agent by its ID. Returns store.ErrNotFound when
+// the agent doesn't exist or has been soft-deleted.
+func (s *Store) GetAgent(ctx context.Context, id string) (*store.Agent, error) {
+	return s.getAgentByID(ctx, id)
+}
+
 func (s *Store) getAgentByID(ctx context.Context, id string) (*store.Agent, error) {
 	a := &store.Agent{}
 	var orgID *string
+	var tokenExpiresAt *time.Time
 	err := s.pool.QueryRow(ctx,
-		`SELECT id, user_id, name, description, token_hash, created_at, org_id FROM agents WHERE id = $1 AND deleted_at IS NULL`,
+		`SELECT id, user_id, name, description, token_hash, created_at, org_id, token_expires_at FROM agents WHERE id = $1 AND deleted_at IS NULL`,
 		id,
-	).Scan(&a.ID, &a.UserID, &a.Name, &a.Description, &a.TokenHash, &a.CreatedAt, &orgID)
+	).Scan(&a.ID, &a.UserID, &a.Name, &a.Description, &a.TokenHash, &a.CreatedAt, &orgID, &tokenExpiresAt)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, store.ErrNotFound
 	}
 	if orgID != nil {
 		a.OrgID = *orgID
+	}
+	if tokenExpiresAt != nil {
+		a.TokenExpiresAt = tokenExpiresAt
 	}
 	if settings, settingsErr := s.GetAgentRuntimeSettings(ctx, a.ID); settingsErr == nil {
 		a.RuntimeSettings = settings
@@ -1036,6 +1046,7 @@ func (s *Store) CreateTask(ctx context.Context, task *store.Task) error {
 	}
 	expectedToolsJSON := rawJSONOrDefaultBytes(task.ExpectedTools, "[]")
 	expectedEgressJSON := rawJSONOrDefaultBytes(task.ExpectedEgress, "[]")
+	requiredCredentialsJSON := rawJSONOrDefaultBytes(task.RequiredCredentials, "[]")
 	var pendingActionJSON []byte
 	if task.PendingAction != nil {
 		pendingActionJSON, _ = json.Marshal(task.PendingAction)
@@ -1049,21 +1060,21 @@ func (s *Store) CreateTask(ctx context.Context, task *store.Task) error {
 		INSERT INTO tasks (id, user_id, agent_id, purpose, status, authorized_actions, planned_calls, callback_url,
 			expires_in_seconds, approved_at, expires_at, pending_action, pending_reason, lifetime,
 			risk_level, risk_details, approval_source, approval_rationale, expected_tools_json,
-			expected_egress_json, intent_verification_mode, expected_use, schema_version, chain_extraction_mode)
-		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24)
+			expected_egress_json, required_credentials_json, intent_verification_mode, expected_use, schema_version, chain_extraction_mode)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25)
 	`, task.ID, task.UserID, task.AgentID, task.Purpose, task.Status,
 		actionsJSON, plannedCallsJSON, task.CallbackURL, task.ExpiresInSeconds,
 		task.ApprovedAt, task.ExpiresAt,
 		nilIfEmpty(pendingActionJSON), task.PendingReason, task.Lifetime,
 		task.RiskLevel, string(riskDetails), task.ApprovalSource, approvalRationale,
-		expectedToolsJSON, expectedEgressJSON, task.IntentVerificationMode, task.ExpectedUse, task.SchemaVersion,
+		expectedToolsJSON, expectedEgressJSON, requiredCredentialsJSON, task.IntentVerificationMode, task.ExpectedUse, task.SchemaVersion,
 		task.ChainExtractionMode)
 	return err
 }
 
 func (s *Store) GetTask(ctx context.Context, id string) (*store.Task, error) {
 	t := &store.Task{}
-	var actionsJSON, plannedCallsJSON, pendingActionJSON, expectedToolsJSON, expectedEgressJSON []byte
+	var actionsJSON, plannedCallsJSON, pendingActionJSON, expectedToolsJSON, expectedEgressJSON, requiredCredentialsJSON []byte
 	var riskDetailsStr, approvalRationaleStr string
 	var chainExtractionMode *string
 	err := s.pool.QueryRow(ctx, `
@@ -1071,13 +1082,13 @@ func (s *Store) GetTask(ctx context.Context, id string) (*store.Task, error) {
 		       created_at, approved_at, expires_at, expires_in_seconds, request_count,
 		       pending_action, pending_reason, lifetime, risk_level, risk_details,
 		       approval_source, approval_rationale, expected_tools_json, expected_egress_json,
-		       intent_verification_mode, expected_use, schema_version, chain_extraction_mode
+		       required_credentials_json, intent_verification_mode, expected_use, schema_version, chain_extraction_mode
 		FROM tasks WHERE id = $1
 	`, id).Scan(&t.ID, &t.UserID, &t.AgentID, &t.Purpose, &t.Status, &actionsJSON,
 		&plannedCallsJSON, &t.CallbackURL, &t.CreatedAt, &t.ApprovedAt, &t.ExpiresAt, &t.ExpiresInSeconds,
 		&t.RequestCount, &pendingActionJSON, &t.PendingReason, &t.Lifetime,
 		&t.RiskLevel, &riskDetailsStr, &t.ApprovalSource, &approvalRationaleStr,
-		&expectedToolsJSON, &expectedEgressJSON, &t.IntentVerificationMode, &t.ExpectedUse, &t.SchemaVersion,
+		&expectedToolsJSON, &expectedEgressJSON, &requiredCredentialsJSON, &t.IntentVerificationMode, &t.ExpectedUse, &t.SchemaVersion,
 		&chainExtractionMode)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, store.ErrNotFound
@@ -1112,6 +1123,9 @@ func (s *Store) GetTask(ctx context.Context, id string) (*store.Task, error) {
 	if expectedEgressJSON != nil {
 		t.ExpectedEgress = json.RawMessage(expectedEgressJSON)
 	}
+	if requiredCredentialsJSON != nil {
+		t.RequiredCredentials = json.RawMessage(requiredCredentialsJSON)
+	}
 	if chainExtractionMode != nil {
 		t.ChainExtractionMode = *chainExtractionMode
 	}
@@ -1145,7 +1159,7 @@ func (s *Store) ListTasks(ctx context.Context, userID string, filter store.TaskF
 		       created_at, approved_at, expires_at, expires_in_seconds, request_count,
 		       pending_action, pending_reason, lifetime, risk_level, risk_details,
 		       approval_source, approval_rationale, expected_tools_json, expected_egress_json,
-		       intent_verification_mode, expected_use, schema_version, chain_extraction_mode
+		       required_credentials_json, intent_verification_mode, expected_use, schema_version, chain_extraction_mode
 		FROM tasks ` + where + ` ORDER BY created_at DESC`
 
 	if filter.Limit > 0 {
@@ -1315,7 +1329,7 @@ func (s *Store) ListExpiredTasks(ctx context.Context) ([]*store.Task, error) {
 		       created_at, approved_at, expires_at, expires_in_seconds, request_count,
 		       pending_action, pending_reason, lifetime, risk_level, risk_details,
 		       approval_source, approval_rationale, expected_tools_json, expected_egress_json,
-		       intent_verification_mode, expected_use, schema_version, chain_extraction_mode
+		       required_credentials_json, intent_verification_mode, expected_use, schema_version, chain_extraction_mode
 		FROM tasks WHERE status = 'active' AND lifetime = 'session' AND expires_at < NOW()
 	`)
 	if err != nil {
@@ -1329,14 +1343,14 @@ func scanTasks(rows pgx.Rows) ([]*store.Task, error) {
 	var tasks []*store.Task
 	for rows.Next() {
 		t := &store.Task{}
-		var actionsJSON, plannedCallsJSON, pendingActionJSON, expectedToolsJSON, expectedEgressJSON []byte
+		var actionsJSON, plannedCallsJSON, pendingActionJSON, expectedToolsJSON, expectedEgressJSON, requiredCredentialsJSON []byte
 		var riskDetailsStr, approvalRationaleStr string
 		var chainExtractionMode *string
 		if err := rows.Scan(&t.ID, &t.UserID, &t.AgentID, &t.Purpose, &t.Status, &actionsJSON,
 			&plannedCallsJSON, &t.CallbackURL, &t.CreatedAt, &t.ApprovedAt, &t.ExpiresAt, &t.ExpiresInSeconds,
 			&t.RequestCount, &pendingActionJSON, &t.PendingReason, &t.Lifetime,
 			&t.RiskLevel, &riskDetailsStr, &t.ApprovalSource, &approvalRationaleStr,
-			&expectedToolsJSON, &expectedEgressJSON, &t.IntentVerificationMode, &t.ExpectedUse, &t.SchemaVersion,
+			&expectedToolsJSON, &expectedEgressJSON, &requiredCredentialsJSON, &t.IntentVerificationMode, &t.ExpectedUse, &t.SchemaVersion,
 			&chainExtractionMode); err != nil {
 			return nil, err
 		}
@@ -1372,6 +1386,9 @@ func scanTasks(rows pgx.Rows) ([]*store.Task, error) {
 		}
 		if expectedEgressJSON != nil {
 			t.ExpectedEgress = json.RawMessage(expectedEgressJSON)
+		}
+		if requiredCredentialsJSON != nil {
+			t.RequiredCredentials = json.RawMessage(requiredCredentialsJSON)
 		}
 		tasks = append(tasks, t)
 	}
@@ -2287,15 +2304,21 @@ func scanRuntimeSession(scanner interface{ Scan(dest ...any) error }) (*store.Ru
 
 func (s *Store) CreateRuntimePlaceholder(ctx context.Context, placeholder *store.RuntimePlaceholder) error {
 	_, err := s.pool.Exec(ctx, `
-		INSERT INTO runtime_placeholders (placeholder, user_id, agent_id, service_id, last_used_at)
-		VALUES ($1,$2,$3,$4,$5)
-	`, placeholder.Placeholder, placeholder.UserID, placeholder.AgentID, placeholder.ServiceID, placeholder.LastUsedAt)
+		INSERT INTO runtime_placeholders (
+			placeholder, user_id, agent_id, service_id, vault_item_id, credential_grant_id,
+			task_id, expires_at, revoked_at, last_used_at, use_count
+		)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
+	`, placeholder.Placeholder, placeholder.UserID, nullableString(placeholder.AgentID), placeholder.ServiceID,
+		placeholder.VaultItemID, placeholder.CredentialGrantID, placeholder.TaskID,
+		placeholder.ExpiresAt, placeholder.RevokedAt, placeholder.LastUsedAt, placeholder.UseCount)
 	return err
 }
 
 func (s *Store) GetRuntimePlaceholder(ctx context.Context, placeholder string) (*store.RuntimePlaceholder, error) {
 	rows, err := s.pool.Query(ctx, `
-		SELECT placeholder, user_id, agent_id, service_id, created_at, last_used_at
+		SELECT placeholder, user_id, agent_id, service_id, vault_item_id, credential_grant_id,
+		       task_id, created_at, expires_at, revoked_at, last_used_at, use_count
 		FROM runtime_placeholders WHERE placeholder = $1
 	`, placeholder)
 	if err != nil {
@@ -2313,7 +2336,8 @@ func (s *Store) GetRuntimePlaceholder(ctx context.Context, placeholder string) (
 
 func (s *Store) ListRuntimePlaceholders(ctx context.Context, userID string) ([]*store.RuntimePlaceholder, error) {
 	rows, err := s.pool.Query(ctx, `
-		SELECT placeholder, user_id, agent_id, service_id, created_at, last_used_at
+		SELECT placeholder, user_id, agent_id, service_id, vault_item_id, credential_grant_id,
+		       task_id, created_at, expires_at, revoked_at, last_used_at, use_count
 		FROM runtime_placeholders
 		WHERE user_id = $1
 		ORDER BY created_at DESC
@@ -2345,7 +2369,7 @@ func (s *Store) DeleteRuntimePlaceholder(ctx context.Context, placeholder, userI
 }
 
 func (s *Store) TouchRuntimePlaceholder(ctx context.Context, placeholder string, usedAt time.Time) error {
-	tag, err := s.pool.Exec(ctx, `UPDATE runtime_placeholders SET last_used_at = $1 WHERE placeholder = $2`, usedAt, placeholder)
+	tag, err := s.pool.Exec(ctx, `UPDATE runtime_placeholders SET last_used_at = $1, use_count = use_count + 1 WHERE placeholder = $2`, usedAt, placeholder)
 	if err != nil {
 		return err
 	}
@@ -2357,8 +2381,16 @@ func (s *Store) TouchRuntimePlaceholder(ctx context.Context, placeholder string,
 
 func scanRuntimePlaceholder(scanner interface{ Scan(dest ...any) error }) (*store.RuntimePlaceholder, error) {
 	placeholder := &store.RuntimePlaceholder{}
-	if err := scanner.Scan(&placeholder.Placeholder, &placeholder.UserID, &placeholder.AgentID, &placeholder.ServiceID, &placeholder.CreatedAt, &placeholder.LastUsedAt); err != nil {
+	var agentID *string
+	if err := scanner.Scan(
+		&placeholder.Placeholder, &placeholder.UserID, &agentID, &placeholder.ServiceID,
+		&placeholder.VaultItemID, &placeholder.CredentialGrantID, &placeholder.TaskID, &placeholder.CreatedAt,
+		&placeholder.ExpiresAt, &placeholder.RevokedAt, &placeholder.LastUsedAt, &placeholder.UseCount,
+	); err != nil {
 		return nil, err
+	}
+	if agentID != nil {
+		placeholder.AgentID = *agentID
 	}
 	return placeholder, nil
 }
@@ -2372,7 +2404,7 @@ func (s *Store) CreateCredentialAuthorization(ctx context.Context, auth *store.C
 			id, approval_id, user_id, agent_id, session_id, scope, credential_ref, service, host,
 			header_name, scheme, status, metadata_json, expires_at, used_at, last_matched_at
 		) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)
-	`, auth.ID, auth.ApprovalID, auth.UserID, auth.AgentID, auth.SessionID, auth.Scope, auth.CredentialRef,
+	`, auth.ID, auth.ApprovalID, auth.UserID, nullableString(auth.AgentID), auth.SessionID, auth.Scope, auth.CredentialRef,
 		auth.Service, auth.Host, auth.HeaderName, auth.Scheme, auth.Status, rawJSONOrDefaultBytes(auth.MetadataJSON, "{}"),
 		auth.ExpiresAt, auth.UsedAt, auth.LastMatchedAt)
 	if err != nil && isDuplicate(err) {
@@ -2399,6 +2431,17 @@ func (s *Store) GetCredentialAuthorization(ctx context.Context, id string) (*sto
 		return nil, store.ErrNotFound
 	}
 	return scanCredentialAuthorization(rows)
+}
+
+func (s *Store) DeleteCredentialAuthorization(ctx context.Context, id, userID string) error {
+	tag, err := s.pool.Exec(ctx, `DELETE FROM credential_authorizations WHERE id = $1 AND user_id = $2`, id, userID)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		return store.ErrNotFound
+	}
+	return nil
 }
 
 func (s *Store) ConsumeMatchingCredentialAuthorization(ctx context.Context, match store.CredentialAuthorizationMatch, now time.Time) (*store.CredentialAuthorization, error) {
@@ -2475,12 +2518,16 @@ func (s *Store) ConsumeMatchingCredentialAuthorization(ctx context.Context, matc
 func scanCredentialAuthorization(scanner interface{ Scan(dest ...any) error }) (*store.CredentialAuthorization, error) {
 	auth := &store.CredentialAuthorization{}
 	var metadataJSON []byte
+	var agentID *string
 	if err := scanner.Scan(
-		&auth.ID, &auth.ApprovalID, &auth.UserID, &auth.AgentID, &auth.SessionID, &auth.Scope,
+		&auth.ID, &auth.ApprovalID, &auth.UserID, &agentID, &auth.SessionID, &auth.Scope,
 		&auth.CredentialRef, &auth.Service, &auth.Host, &auth.HeaderName, &auth.Scheme, &auth.Status,
 		&metadataJSON, &auth.CreatedAt, &auth.ExpiresAt, &auth.UsedAt, &auth.LastMatchedAt,
 	); err != nil {
 		return nil, err
+	}
+	if agentID != nil {
+		auth.AgentID = *agentID
 	}
 	auth.MetadataJSON = json.RawMessage(metadataJSON)
 	return auth, nil
@@ -2841,6 +2888,13 @@ func rawJSONOrDefaultBytes(msg json.RawMessage, fallback string) []byte {
 	return []byte(msg)
 }
 
+func nullableString(s string) any {
+	if s == "" {
+		return nil
+	}
+	return s
+}
+
 // ── MCP Sessions ─────────────────────────────────────────────────────────────
 
 func (s *Store) CreateMCPSession(ctx context.Context, id string, expiresAt time.Time) error {
@@ -2957,6 +3011,16 @@ func (s *Store) ListPendingConnectionRequests(ctx context.Context, userID string
 		out = append(out, r)
 	}
 	return out, rows.Err()
+}
+
+func (s *Store) UpdateConnectionRequestStatusIfPending(ctx context.Context, id, status string) (bool, error) {
+	tag, err := s.pool.Exec(ctx,
+		`UPDATE connection_requests SET status = $1 WHERE id = $2 AND status = 'pending'`,
+		status, id)
+	if err != nil {
+		return false, err
+	}
+	return tag.RowsAffected() > 0, nil
 }
 
 func (s *Store) UpdateConnectionRequestStatus(ctx context.Context, id, status, agentID string) error {

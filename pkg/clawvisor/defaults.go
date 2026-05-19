@@ -44,6 +44,7 @@ import (
 	telegramnotify "github.com/clawvisor/clawvisor/internal/notify/telegram"
 	intredis "github.com/clawvisor/clawvisor/internal/redis"
 	"github.com/clawvisor/clawvisor/internal/relay"
+	"github.com/clawvisor/clawvisor/internal/runtime/llmproxy"
 	pgstore "github.com/clawvisor/clawvisor/pkg/store/postgres"
 	sqlitestore "github.com/clawvisor/clawvisor/pkg/store/sqlite"
 	intvault "github.com/clawvisor/clawvisor/pkg/vault"
@@ -196,7 +197,6 @@ func DefaultOptions(logger *slog.Logger, configPath ...string) (*ServerOptions, 
 		goOverrides["microsoft.onedrive:"+action] = onedrive.Execute
 	}
 
-
 	// Build adapter loading source (for startup) and generator factory (for per-request use).
 	var adapterSource yamlloader.UserAdapterSource
 	var adapterGenFactory handlers.GeneratorFactory
@@ -249,9 +249,18 @@ func DefaultOptions(logger *slog.Logger, configPath ...string) (*ServerOptions, 
 	// Each *.mcp.yaml in internal/adapters/definitions/mcp/ becomes a service.
 	// The MCPAdapter handles tool discovery, execution, and identity (via the
 	// whoami hook); response sanitization happens generically in gateway middleware.
+	//
+	// A malformed bundled .mcp.yaml is degrading — the affected service is
+	// unavailable — but it must not crash every deployment, including users
+	// who never enabled MCP. Log and continue with whatever loaded
+	// successfully; LoadFromFS returns the parsed subset alongside the
+	// error.
 	mcpAdapters, err := mcpadapter.LoadFromFS(mcpdefs.FS, ".")
 	if err != nil {
-		return nil, fmt.Errorf("loading MCP adapter specs: %w", err)
+		logger.Warn("loading MCP adapter specs partially failed; affected services will be unavailable",
+			"err", err.Error(),
+			"loaded_count", len(mcpAdapters),
+		)
 	}
 	mcpByID := make(map[string]*mcpadapter.MCPAdapter, len(mcpAdapters))
 	for _, ma := range mcpAdapters {
@@ -408,11 +417,14 @@ func DefaultOptions(logger *slog.Logger, configPath ...string) (*ServerOptions, 
 	var ticketStore auth.TicketStorer
 	var replayCache middleware.ReplayCache
 	var tokenCache handlers.TokenCache
+	var claimCodeCache handlers.ClaimCodeCache
 	var devicePairingStore handlers.DevicePairingStore
 	var oauthStateStore handlers.OAuthStateStore
 	var pairingCodeStore handlers.PairingCodeStore
 	var dedupCache handlers.DedupCache
 	var verdictCache intent.VerdictCacher
+	var callerNonceCache llmproxy.CallerNonceCache
+	var pendingSecretCache llmproxy.PendingSecretDecisionCache
 	var extractionTracker handlers.ExtractionTracker
 	var rdb *redis.Client
 	if cfg.Redis.URL != "" {
@@ -429,6 +441,7 @@ func DefaultOptions(logger *slog.Logger, configPath ...string) (*ServerOptions, 
 		ticketStore = auth.NewRedisTicketStore(client)
 		replayCache = middleware.NewRedisReplayCache(client)
 		tokenCache = handlers.NewRedisTokenCache(client, 5*time.Minute)
+		claimCodeCache = handlers.NewRedisClaimCodeCache(client)
 		devicePairingStore = handlers.NewRedisDevicePairingStore(client)
 		oauthStateStore = handlers.NewRedisOAuthStateStore(client)
 		pairingCodeStore = handlers.NewRedisPairingCodeStore(client, 5*time.Minute, 3)
@@ -444,6 +457,13 @@ func DefaultOptions(logger *slog.Logger, configPath ...string) (*ServerOptions, 
 			verdictTTL = 60 * time.Second
 		}
 		verdictCache = intent.NewRedisVerdictCache(client, verdictTTL)
+
+		// Lite-proxy caller-auth nonces: cross-instance consumption.
+		// 5-minute TTL covers the typical proxy-to-resolver round-trip
+		// (well under a minute in practice) plus held-tool-use release
+		// windows that re-mint a fresh nonce.
+		callerNonceCache = llmproxy.NewRedisCallerNonceCache(client, 5*time.Minute)
+		pendingSecretCache = llmproxy.NewRedisPendingSecretDecisionCache(client, 10*time.Minute)
 
 		// Safety TTL exceeds the 30s extraction timeout + 10s save timeout
 		// so a crashed instance doesn't orphan entries.
@@ -464,15 +484,7 @@ func DefaultOptions(logger *slog.Logger, configPath ...string) (*ServerOptions, 
 		logger.Info("redis connected", "addr", client.Options().Addr)
 	}
 
-	features := FeatureSet{
-		PasswordAuth:      cfg.Server.AuthMode == "password",
-		RuntimeProxy:      cfg.RuntimeProxy.Enabled,
-		SecretVault:       cfg.RuntimeProxy.Enabled && cfg.Features.SecretVault,
-		RuntimePolicyUI:   cfg.RuntimeProxy.Enabled,
-		RuntimeActivity:   cfg.RuntimeProxy.Enabled,
-		AgentLiveSessions: cfg.RuntimeProxy.Enabled,
-		ServicePresets:    cfg.RuntimeProxy.Enabled && cfg.Features.ServicePresets,
-	}
+	features := computeFeatureSet(cfg)
 
 	opts := &ServerOptions{
 		Logger:             logger,
@@ -492,12 +504,15 @@ func DefaultOptions(logger *slog.Logger, configPath ...string) (*ServerOptions, 
 		TicketStore:        ticketStore,
 		ReplayCache:        replayCache,
 		TokenCache:         tokenCache,
+		ClaimCodeCache:     claimCodeCache,
 		DevicePairingStore: devicePairingStore,
 		OAuthStateStore:    oauthStateStore,
 		PairingCodeStore:   pairingCodeStore,
 		DedupCache:         dedupCache,
 		VerdictCache:       verdictCache,
 		ExtractionTracker:  extractionTracker,
+		CallerNonceCache:   callerNonceCache,
+		PendingSecretCache: pendingSecretCache,
 		RedisClient:        rdb,
 	}
 
@@ -620,4 +635,34 @@ func buildVault(cfg *config.Config, db *sql.DB, driver string) (vault.Vault, err
 	default:
 		return nil, fmt.Errorf("unsupported vault backend %q (use \"local\" or \"gcp\")", cfg.Vault.Backend)
 	}
+}
+
+// computeFeatureSet returns the FeatureSet derived from cfg. Pulled
+// out of newServerOptions so the feature-flag matrix is testable in
+// isolation. When proxy_lite is disabled, this preserves main-branch
+// runtime feature behavior; proxy_lite opt-in adds the lite surfaces.
+func computeFeatureSet(cfg *config.Config) FeatureSet {
+	if cfg == nil {
+		return FeatureSet{}
+	}
+	proxyLiteEnabled := cfg.ProxyLite.Enabled
+	runtimeSurface := runtimePolicySurfaceEnabled(cfg)
+	secretVault := cfg.RuntimeProxy.Enabled && cfg.Features.SecretVault
+	if proxyLiteEnabled {
+		secretVault = true
+	}
+	return FeatureSet{
+		PasswordAuth:      cfg.Server.AuthMode == "password",
+		RuntimeProxy:      cfg.RuntimeProxy.Enabled,
+		ProxyLite:         proxyLiteEnabled,
+		SecretVault:       secretVault,
+		RuntimePolicyUI:   runtimeSurface,
+		RuntimeActivity:   runtimeSurface,
+		AgentLiveSessions: cfg.RuntimeProxy.Enabled || proxyLiteEnabled,
+		ServicePresets:    runtimeSurface && cfg.Features.ServicePresets,
+	}
+}
+
+func runtimePolicySurfaceEnabled(cfg *config.Config) bool {
+	return cfg != nil && (cfg.RuntimeProxy.Enabled || cfg.ProxyLite.Enabled)
 }

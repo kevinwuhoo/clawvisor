@@ -147,6 +147,54 @@ func TestBuildVerificationUserMessage_NoExpectedUse(t *testing.T) {
 	}
 }
 
+func TestBuildVerificationUserMessage_EmptyReasonUsesHarnessSentinel(t *testing.T) {
+	req := VerifyRequest{
+		TaskPurpose: "Inspect repository status",
+		ExpectedUse: "Run read-only git and file inspection commands",
+		Service:     "tool.exec",
+		Action:      "exec",
+		Params:      map[string]any{"command": "git status --short"},
+		Reason:      "",
+		ProxyLite:   true,
+	}
+	msg := buildVerificationUserMessage(req)
+	if !contains(msg, "<no per-call rationale: harness tool schema does not collect one>") {
+		t.Fatalf("expected harness sentinel for empty reason, got %s", msg)
+	}
+	if contains(msg, "<reason></reason>") {
+		t.Fatalf("empty reason should not be sent as an empty reason tag: %s", msg)
+	}
+}
+
+func TestBuildVerificationUserMessage_EmptyReasonStaysEmptyOutsideProxyLite(t *testing.T) {
+	req := VerifyRequest{
+		TaskPurpose: "Inspect repository status",
+		ExpectedUse: "Run read-only git and file inspection commands",
+		Service:     "tool.exec",
+		Action:      "exec",
+		Params:      map[string]any{"command": "git status --short"},
+		Reason:      "",
+	}
+	msg := buildVerificationUserMessage(req)
+	if contains(msg, "<no per-call rationale: harness tool schema does not collect one>") {
+		t.Fatalf("non-proxy-lite request should not inject harness sentinel: %s", msg)
+	}
+	if !contains(msg, "<reason></reason>") {
+		t.Fatalf("expected empty reason tag outside proxy-lite, got %s", msg)
+	}
+}
+
+func TestVerificationSystemPromptForProxyLite(t *testing.T) {
+	base := verificationSystemPromptFor(false)
+	proxyLite := verificationSystemPromptFor(true)
+	if contains(base, "PROXY LITE MODE") || contains(base, "HARNESS WITHOUT PER-CALL RATIONALE") {
+		t.Fatalf("base prompt should not include proxy-lite-only guidance")
+	}
+	if !contains(proxyLite, "PROXY LITE MODE") || !contains(proxyLite, "HARNESS WITHOUT PER-CALL RATIONALE") {
+		t.Fatalf("proxy-lite prompt should include proxy-lite guidance")
+	}
+}
+
 func TestCacheHitAndMiss(t *testing.T) {
 	c := newVerdictCache(time.Minute)
 	key := cacheKey("test-key")
@@ -214,6 +262,11 @@ func TestBuildCacheKey(t *testing.T) {
 
 	if key1 == key2 {
 		t.Error("different reasons should produce different cache keys")
+	}
+	reqProxyLite := req1
+	reqProxyLite.ProxyLite = true
+	if buildCacheKey(req1) == buildCacheKey(reqProxyLite) {
+		t.Error("proxy-lite requests should use a distinct cache key")
 	}
 
 	// Same request → same key

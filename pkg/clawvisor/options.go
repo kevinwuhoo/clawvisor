@@ -17,6 +17,7 @@ import (
 	"github.com/clawvisor/clawvisor/internal/intent"
 	"github.com/clawvisor/clawvisor/internal/notify/push"
 	"github.com/clawvisor/clawvisor/internal/relay"
+	"github.com/clawvisor/clawvisor/internal/runtime/llmproxy"
 	"github.com/clawvisor/clawvisor/pkg/adapters"
 	"github.com/clawvisor/clawvisor/pkg/auth"
 	"github.com/clawvisor/clawvisor/pkg/config"
@@ -139,12 +140,15 @@ type ServerOptions struct {
 	TicketStore        intauth.TicketStorer
 	ReplayCache        middleware.ReplayCache
 	TokenCache         handlers.TokenCache
+	ClaimCodeCache     handlers.ClaimCodeCache
 	DevicePairingStore handlers.DevicePairingStore
 	OAuthStateStore    handlers.OAuthStateStore
 	PairingCodeStore   handlers.PairingCodeStore
 	DedupCache         handlers.DedupCache
 	VerdictCache       intent.VerdictCacher
 	ExtractionTracker  handlers.ExtractionTracker
+	CallerNonceCache   llmproxy.CallerNonceCache
+	PendingSecretCache llmproxy.PendingSecretDecisionCache
 	RedisClient        *redis.Client
 }
 
@@ -209,6 +213,7 @@ type FeatureSet struct {
 	Billing           bool `json:"billing"`
 	LocalDaemon       bool `json:"local_daemon"`
 	RuntimeProxy      bool `json:"runtime_proxy"`
+	ProxyLite         bool `json:"proxy_lite"`
 	SecretVault       bool `json:"secret_vault"`
 	RuntimePolicyUI   bool `json:"runtime_policy_ui"`
 	RuntimeActivity   bool `json:"runtime_activity"`

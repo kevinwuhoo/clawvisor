@@ -1,0 +1,270 @@
+package clawvisorcli
+
+import (
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"testing"
+
+	"github.com/spf13/cobra"
+)
+
+func TestBuildLiteProxyEnvClaude(t *testing.T) {
+	env, err := buildLiteProxyEnv("claude", " https://clawvisor.example/ ", "cvis_token")
+	if err != nil {
+		t.Fatalf("buildLiteProxyEnv: %v", err)
+	}
+	values := envMap(env)
+
+	if got := values["CLAWVISOR_URL"]; got != "https://clawvisor.example" {
+		t.Fatalf("CLAWVISOR_URL = %q", got)
+	}
+	if got := values["CLAWVISOR_AGENT_TOKEN"]; got != "cvis_token" {
+		t.Fatalf("CLAWVISOR_AGENT_TOKEN = %q", got)
+	}
+	if got := values["CLAWVISOR_PROXY_LITE"]; got != "1" {
+		t.Fatalf("CLAWVISOR_PROXY_LITE = %q", got)
+	}
+	if got := values["CLAWVISOR_PROXY_LITE_PROVIDER"]; got != "claude" {
+		t.Fatalf("CLAWVISOR_PROXY_LITE_PROVIDER = %q", got)
+	}
+	if got := values["ANTHROPIC_BASE_URL"]; got != "https://clawvisor.example" {
+		t.Fatalf("ANTHROPIC_BASE_URL = %q", got)
+	}
+	if got := values["ANTHROPIC_CUSTOM_HEADERS"]; got != "X-Clawvisor-Agent-Token: cvis_token" {
+		t.Fatalf("ANTHROPIC_CUSTOM_HEADERS = %q", got)
+	}
+	if got, ok := values["ANTHROPIC_AUTH_TOKEN"]; !ok {
+		t.Fatalf("ANTHROPIC_AUTH_TOKEN not present in env; expected explicit empty value to preserve subscription OAuth fallback")
+	} else if got != "" {
+		t.Fatalf("ANTHROPIC_AUTH_TOKEN = %q", got)
+	}
+	// Two-step check: the key must be present in the env (so it explicitly
+	// overrides any inherited ANTHROPIC_API_KEY), AND its value must be "".
+	// `values[key]` returning "" alone can't distinguish "explicitly empty"
+	// from "missing entirely".
+	if got, ok := values["ANTHROPIC_API_KEY"]; !ok {
+		t.Fatalf("ANTHROPIC_API_KEY not present in env; expected explicit empty value to mask inherited key")
+	} else if got != "" {
+		t.Fatalf("ANTHROPIC_API_KEY = %q, want explicitly empty", got)
+	}
+	if _, ok := values["OPENAI_BASE_URL"]; ok {
+		t.Fatalf("OPENAI_BASE_URL should be omitted for claude, got %q", values["OPENAI_BASE_URL"])
+	}
+}
+
+func TestBuildLiteProxyEnvCodex(t *testing.T) {
+	env, err := buildLiteProxyEnv("codex", "https://clawvisor.example", "cvis_token")
+	if err != nil {
+		t.Fatalf("buildLiteProxyEnv: %v", err)
+	}
+	values := envMap(env)
+
+	if got := values["OPENAI_BASE_URL"]; got != "https://clawvisor.example/v1" {
+		t.Fatalf("OPENAI_BASE_URL = %q", got)
+	}
+	if _, ok := values["OPENAI_API_KEY"]; ok {
+		t.Fatalf("OPENAI_API_KEY should be omitted for codex OpenAI-auth passthrough")
+	}
+	if got, ok := values["ANTHROPIC_BASE_URL"]; ok {
+		t.Fatalf("ANTHROPIC_BASE_URL should be omitted for codex, got %q (present in env)", got)
+	}
+}
+
+func TestBuildLiteProxyEnvCodexAvoidsDuplicateV1(t *testing.T) {
+	env, err := buildLiteProxyEnv("codex", "https://clawvisor.example/v1/", "cvis_token")
+	if err != nil {
+		t.Fatalf("buildLiteProxyEnv: %v", err)
+	}
+	if got := envMap(env)["OPENAI_BASE_URL"]; got != "https://clawvisor.example/v1" {
+		t.Fatalf("OPENAI_BASE_URL = %q", got)
+	}
+}
+
+func TestBuildLiteProxyEnvRejectsUnknownProvider(t *testing.T) {
+	_, err := buildLiteProxyEnv("gemini", "https://clawvisor.example", "cvis_token")
+	if err == nil || !strings.Contains(err.Error(), "unsupported proxy-lite provider") {
+		t.Fatalf("error = %v, want unsupported provider", err)
+	}
+}
+
+func TestBuildLiteProxyEnvRequiresToken(t *testing.T) {
+	_, err := buildLiteProxyEnv("codex", "https://clawvisor.example", " ")
+	if err == nil || !strings.Contains(err.Error(), "agent token is required") {
+		t.Fatalf("error = %v, want missing token", err)
+	}
+}
+
+func TestLiteProxyRunPlanInfersClaudeFromCommand(t *testing.T) {
+	provider, commandArgs, err := liteProxyRunPlan([]string{"/usr/local/bin/claude", "--model", "sonnet"}, "")
+	if err != nil {
+		t.Fatalf("liteProxyRunPlan: %v", err)
+	}
+	if provider != "claude" {
+		t.Fatalf("provider = %q", provider)
+	}
+	if strings.Join(commandArgs, "\x00") != "/usr/local/bin/claude\x00--model\x00sonnet" {
+		t.Fatalf("commandArgs = %#v", commandArgs)
+	}
+}
+
+func TestLiteProxyRunPlanInfersCodexFromCommand(t *testing.T) {
+	provider, commandArgs, err := liteProxyRunPlan([]string{"codex", "hello"}, "")
+	if err != nil {
+		t.Fatalf("liteProxyRunPlan: %v", err)
+	}
+	if provider != "codex" {
+		t.Fatalf("provider = %q", provider)
+	}
+	if strings.Join(commandArgs, "\x00") != "codex\x00hello" {
+		t.Fatalf("commandArgs = %#v", commandArgs)
+	}
+}
+
+func TestLiteProxyRunPlanUsesExplicitProviderForWrapper(t *testing.T) {
+	provider, commandArgs, err := liteProxyRunPlan([]string{"my-codex-wrapper", "--debug"}, "codex")
+	if err != nil {
+		t.Fatalf("liteProxyRunPlan: %v", err)
+	}
+	if provider != "codex" {
+		t.Fatalf("provider = %q", provider)
+	}
+	if strings.Join(commandArgs, "\x00") != "my-codex-wrapper\x00--debug" {
+		t.Fatalf("commandArgs = %#v", commandArgs)
+	}
+}
+
+func TestLiteProxyRunPlanDefaultsCommandWithExplicitProvider(t *testing.T) {
+	provider, commandArgs, err := liteProxyRunPlan(nil, "claude")
+	if err != nil {
+		t.Fatalf("liteProxyRunPlan: %v", err)
+	}
+	if provider != "claude" {
+		t.Fatalf("provider = %q", provider)
+	}
+	if strings.Join(commandArgs, "\x00") != "claude" {
+		t.Fatalf("commandArgs = %#v", commandArgs)
+	}
+}
+
+func TestLiteProxyRunPlanRequiresProviderForUnknownCommand(t *testing.T) {
+	_, _, err := liteProxyRunPlan([]string{"my-wrapper"}, "")
+	if err == nil || !strings.Contains(err.Error(), "could not infer proxy-lite provider") {
+		t.Fatalf("error = %v, want inference failure", err)
+	}
+}
+
+func TestPrepareLiteProxyCommandArgsInjectsCodexConfig(t *testing.T) {
+	opts := &liteProxyOptions{Provider: "codex", BaseURL: "https://clawvisor.example"}
+	got := prepareLiteProxyCommandArgs(opts, []string{"codex", "exec", "hello"})
+	want := []string{
+		"codex",
+		"-c", "model_provider=clawvisor",
+		"-c", `model_providers.clawvisor.name="clawvisor"`,
+		"-c", `model_providers.clawvisor.base_url="https://clawvisor.example/v1"`,
+		"-c", `model_providers.clawvisor.wire_api="responses"`,
+		"-c", `model_providers.clawvisor.requires_openai_auth=true`,
+		"-c", `model_providers.clawvisor.env_http_headers={"X-Clawvisor-Agent-Token"="CLAWVISOR_AGENT_TOKEN"}`,
+		"exec",
+		"hello",
+	}
+	if strings.Join(got, "\x00") != strings.Join(want, "\x00") {
+		t.Fatalf("command args = %#v, want %#v", got, want)
+	}
+}
+
+func TestPrepareLiteProxyCommandArgsLeavesNonCodexWrapperAlone(t *testing.T) {
+	opts := &liteProxyOptions{Provider: "codex", BaseURL: "https://clawvisor.example"}
+	got := prepareLiteProxyCommandArgs(opts, []string{"my-codex-wrapper", "hello"})
+	want := []string{"my-codex-wrapper", "hello"}
+	if strings.Join(got, "\x00") != strings.Join(want, "\x00") {
+		t.Fatalf("command args = %#v, want %#v", got, want)
+	}
+}
+
+func TestAgentCommandTreeDefaultsToLiteAndHidesFullProxyCommands(t *testing.T) {
+	agent := childCommand(rootCmd, "agent")
+	if agent == nil {
+		t.Fatal("agent command not registered")
+	}
+	run := childCommand(agent, "run")
+	if run == nil {
+		t.Fatal("agent run command not registered")
+	}
+	if !strings.Contains(run.Short, "proxy-lite") {
+		t.Fatalf("agent run short = %q, want proxy-lite command", run.Short)
+	}
+
+	for _, name := range []string{"runtime-env", "docker-env", "docker-run", "docker-compose"} {
+		if childCommand(agent, name) != nil {
+			t.Fatalf("agent %s should not be registered on the public CLI", name)
+		}
+	}
+	if childCommand(rootCmd, "proxy") != nil {
+		t.Fatal("root proxy command should not be registered on the public CLI")
+	}
+}
+
+func childCommand(parent *cobra.Command, name string) *cobra.Command {
+	for _, cmd := range parent.Commands() {
+		if cmd.Name() == name {
+			return cmd
+		}
+	}
+	return nil
+}
+
+func TestEnsureLiteProxyEnabled_AllowsWhenFlagOn(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/features" {
+			http.NotFound(w, r)
+			return
+		}
+		_, _ = w.Write([]byte(`{"proxy_lite":true,"secret_vault":false}`))
+	}))
+	defer srv.Close()
+	t.Setenv("CLAWVISOR_SKIP_LITE_PROXY_PRECHECK", "")
+	if err := ensureLiteProxyEnabled(srv.URL); err != nil {
+		t.Fatalf("expected no error when proxy_lite=true, got %v", err)
+	}
+}
+
+func TestEnsureLiteProxyEnabled_RejectsWhenFlagOff(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/features" {
+			http.NotFound(w, r)
+			return
+		}
+		_, _ = w.Write([]byte(`{"proxy_lite":false}`))
+	}))
+	defer srv.Close()
+	t.Setenv("CLAWVISOR_SKIP_LITE_PROXY_PRECHECK", "")
+	err := ensureLiteProxyEnabled(srv.URL)
+	if err == nil {
+		t.Fatal("expected error when proxy_lite=false")
+	}
+	if !strings.Contains(err.Error(), "proxy-lite is not enabled") {
+		t.Fatalf("expected clear error message, got %q", err.Error())
+	}
+}
+
+func TestEnsureLiteProxyEnabled_AllowsWhenDaemonOlder(t *testing.T) {
+	// Older daemons may 404 on /api/features. The CLI should not block
+	// the launch; let the harness see the real /v1/* response.
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.NotFound(w, r)
+	}))
+	defer srv.Close()
+	t.Setenv("CLAWVISOR_SKIP_LITE_PROXY_PRECHECK", "")
+	if err := ensureLiteProxyEnabled(srv.URL); err != nil {
+		t.Fatalf("expected pass-through on 404, got %v", err)
+	}
+}
+
+func TestEnsureLiteProxyEnabled_SkipEnvBypassesPrecheck(t *testing.T) {
+	t.Setenv("CLAWVISOR_SKIP_LITE_PROXY_PRECHECK", "1")
+	// URL is intentionally unreachable; the env var should short-circuit.
+	if err := ensureLiteProxyEnabled("http://127.0.0.1:1"); err != nil {
+		t.Fatalf("skip env should bypass any preflight, got %v", err)
+	}
+}

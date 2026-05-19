@@ -8,7 +8,7 @@ import (
 	"strings"
 )
 
-var placeholderTokenRE = regexp.MustCompile(`[A-Za-z0-9._:-]*(?:autovault|clawvisor)[A-Za-z0-9._:-]+`)
+var placeholderTokenRE = regexp.MustCompile(`[A-Za-z0-9._:-]*autovault[A-Za-z0-9._:-]+`)
 
 func ReplaceHeaderValue(value string, resolve func(placeholder string) (string, error)) (string, []string, error) {
 	if !HeaderMaybeContainsShadow(value) {
@@ -83,7 +83,7 @@ func ExtractCredentialValue(credential []byte) (string, error) {
 	}
 	for _, key := range []string{"access_token", "token", "api_key", "password"} {
 		if raw, ok := decoded[key].(string); ok && strings.TrimSpace(raw) != "" {
-			return raw, nil
+			return strings.TrimSpace(raw), nil
 		}
 	}
 	return "", fmt.Errorf("credential has no swappable token field")

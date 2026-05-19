@@ -6,7 +6,6 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
-	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -17,17 +16,17 @@ import (
 	"time"
 
 	"github.com/elazarl/goproxy"
+	"github.com/google/uuid"
 
 	"github.com/clawvisor/clawvisor/internal/llm"
 	runtimeautovault "github.com/clawvisor/clawvisor/internal/runtime/autovault"
 	"github.com/clawvisor/clawvisor/internal/runtime/conversation"
+	"github.com/clawvisor/clawvisor/internal/runtime/llmproxy"
 	runtimetiming "github.com/clawvisor/clawvisor/internal/runtime/timing"
 	"github.com/clawvisor/clawvisor/pkg/config"
 	"github.com/clawvisor/clawvisor/pkg/store"
 	"github.com/clawvisor/clawvisor/pkg/vault"
 )
-
-const defaultRuntimeAdjudicationTimeout = 10 * time.Second
 
 type InboundSecretHooks struct {
 	Store  store.Store
@@ -41,11 +40,7 @@ type capturedSecretEntry struct {
 	ServiceID   string
 }
 
-type adjudicationVerdict struct {
-	Credential bool
-	Service    string
-	Confidence float64
-}
+type adjudicationVerdict = runtimeautovault.SecretAdjudicationVerdict
 
 // adjudicationDebugRecord is a single observation suitable for emitting to a
 // debug log when CLAWVISOR_RUNTIME_PROXY_ADJUDICATION_DEBUG_DIR is set. It
@@ -266,7 +261,7 @@ func (s *Server) scanAndReplaceRuntimeSecrets(ctx context.Context, hooks Inbound
 func (s *runtimeSecretScanner) walk(ctx context.Context, value any, fieldName string, topLevel bool, skipHeuristic bool) (any, bool) {
 	switch typed := value.(type) {
 	case string:
-		if runtimeProtectedStringFields[strings.ToLower(strings.TrimSpace(fieldName))] {
+		if runtimeautovault.ProtectedStringField(fieldName) {
 			s.skippedFields++
 			return value, false
 		}
@@ -278,7 +273,7 @@ func (s *runtimeSecretScanner) walk(ctx context.Context, value any, fieldName st
 		}
 		changed := false
 		for key, item := range typed {
-			childSkipHeuristic := skipHeuristic || (topLevel && runtimeNoiseSubtreeKeys[key])
+			childSkipHeuristic := skipHeuristic || (topLevel && runtimeautovault.NoiseSubtreeKey(key))
 			next, nextChanged := s.walk(ctx, item, key, false, childSkipHeuristic)
 			if nextChanged {
 				typed[key] = next
@@ -307,16 +302,17 @@ func (s *runtimeSecretScanner) rewriteString(ctx context.Context, value string, 
 	s.stringsSeen++
 
 	knownPrefixStartedAt := time.Now()
-	for _, spec := range knownPrefixSpecs {
+	for _, spec := range runtimeautovault.KnownPrefixSpecs() {
 		if !strings.Contains(value, spec.Prefix) {
 			continue
 		}
 		re := prefixRegexFor(spec.Prefix)
 		value = re.ReplaceAllStringFunc(value, func(match string) string {
-			if runtimeautovault.LooksLikeShadow(match) {
+			leading, secret := runtimeautovault.SplitPrefixRegexMatch(spec.Prefix, match)
+			if runtimeautovault.LooksLikeShadow(secret) || runtimeautovault.LooksLikeIdentifier(secret) {
 				return match
 			}
-			placeholder, err := s.placeholderForValue(ctx, spec.Service, match)
+			placeholder, err := s.placeholderForValue(ctx, spec.Service, secret)
 			if err != nil {
 				return match
 			}
@@ -324,7 +320,7 @@ func (s *runtimeSecretScanner) rewriteString(ctx context.Context, value string, 
 			s.replacements++
 			s.sourceSet["known_prefix"] = struct{}{}
 			s.serviceLabels[spec.Service] = struct{}{}
-			return placeholder
+			return leading + placeholder
 		})
 	}
 	s.addMetric("inbound_secret.scan.known_prefix", time.Since(knownPrefixStartedAt))
@@ -332,6 +328,7 @@ func (s *runtimeSecretScanner) rewriteString(ctx context.Context, value string, 
 	if skipHeuristic {
 		return value, replaced && value != original
 	}
+
 	protocolNoiseStartedAt := time.Now()
 	if runtimeLooksLikeProtocolNoise(fieldName, value) {
 		s.addMetric("inbound_secret.scan.protocol_noise_check", time.Since(protocolNoiseStartedAt))
@@ -358,7 +355,7 @@ func (s *runtimeSecretScanner) rewriteString(ctx context.Context, value string, 
 		if runtimeautovault.LooksLikeShadow(candidate.Value) {
 			continue
 		}
-		if placeholder, ok := s.lookupReusablePlaceholder(candidate.Value); ok {
+		if placeholder, ok := s.lookupReusablePlaceholder(ctx, candidate.Value); ok {
 			value = strings.ReplaceAll(value, candidate.Value, placeholder)
 			replaced = true
 			s.replacements++
@@ -406,7 +403,7 @@ func (s *runtimeSecretScanner) rewriteString(ctx context.Context, value string, 
 		if runtimeautovault.LooksLikeShadow(passwordValue) {
 			continue
 		}
-		placeholder, ok := s.lookupReusablePlaceholder(passwordValue)
+		placeholder, ok := s.lookupReusablePlaceholder(ctx, passwordValue)
 		if !ok {
 			var err error
 			placeholder, err = s.placeholderForValue(ctx, guessService(fieldName, value), passwordValue)
@@ -451,50 +448,27 @@ func (s *runtimeSecretScanner) flushMetrics(ctx context.Context) {
 }
 
 func runtimeLooksLikeContextNoise(value string) bool {
-	if len(value) < 64 {
-		return false
-	}
-	for _, prefix := range runtimeContextNoisePrefixes {
-		if strings.Contains(value, prefix) {
-			return true
-		}
-	}
-	return false
+	return runtimeautovault.LooksLikeContextNoise(value)
 }
 
 func runtimeLooksLikeProtocolNoise(fieldName, value string) bool {
-	field := strings.ToLower(strings.TrimSpace(fieldName))
-	switch field {
-	case "tool_use_id", "id":
-		return strings.HasPrefix(value, "toolu_")
-	case "type":
-		return strings.HasPrefix(value, "clear_thinking_")
-	default:
-		return false
-	}
+	return runtimeautovault.LooksLikeProtocolNoise(fieldName, value)
 }
 
 func stripRuntimeHarnessMetadataTags(value string) string {
-	if value == "" || !strings.Contains(value, "<") {
-		return value
-	}
-	out := value
-	for _, re := range runtimeHarnessMetadataREs {
-		out = re.ReplaceAllString(out, "")
-	}
-	return out
+	return runtimeautovault.StripHarnessMetadataTags(value)
 }
 
 func (s *runtimeSecretScanner) placeholderForValue(ctx context.Context, service, raw string) (string, error) {
-	placeholder, err := captureRuntimeSecret(ctx, s.server, s.hooks.Store, s.hooks.Vault, s.session, service, raw)
+	placeholder, err := captureRuntimeSecret(ctx, s.server, s.hooks.Store, s.hooks.Vault, s.session, s.host, service, raw)
 	if err == nil {
 		s.serviceLabels[normalizeSecretService(service)] = struct{}{}
 	}
 	return placeholder, err
 }
 
-func (s *runtimeSecretScanner) lookupReusablePlaceholder(raw string) (string, bool) {
-	return lookupRuntimeSecretPlaceholder(s.server, s.session, raw)
+func (s *runtimeSecretScanner) lookupReusablePlaceholder(ctx context.Context, raw string) (string, bool) {
+	return lookupRuntimeSecretPlaceholder(ctx, s.server, s.hooks.Store, s.session, raw)
 }
 
 func (s *runtimeSecretScanner) recordAdjudicationDebug(rec adjudicationDebugRecord) {
@@ -552,7 +526,7 @@ type adjudicationTask struct {
 // applied to every task referencing the same secret regardless of context.
 func (s *runtimeSecretScanner) prewarmVerdicts(ctx context.Context, payload any) {
 	cfg := verificationConfig(s.hooks.Config)
-	if !cfg.Enabled || cfg.Endpoint == "" || cfg.Model == "" {
+	if !runtimeautovault.SecretAdjudicatorConfigured(cfg) {
 		return
 	}
 	seen := map[string]struct{}{}
@@ -630,7 +604,7 @@ func (s *runtimeSecretScanner) runAdjudicationGroup(ctx context.Context, client 
 	rep := group[0]
 	startedAt := time.Now()
 	raw, err := client.Complete(ctx, []llm.ChatMessage{
-		{Role: "system", Content: runtimeSecretAdjudicatorSystemPrompt},
+		{Role: "system", Content: runtimeautovault.SecretAdjudicatorSystemPrompt},
 		{Role: "user", Content: buildSecretAdjudicatorPrompt(s.host, rep.fieldName, rep.content, rep.candidate)},
 	})
 	duration := time.Since(startedAt)
@@ -689,7 +663,7 @@ func secretValueVerdictKey(host, value string) string {
 func (s *runtimeSecretScanner) collectAdjudicationTasks(value any, fieldName string, topLevel, skipHeuristic bool, seen map[string]struct{}, out *[]adjudicationTask) {
 	switch typed := value.(type) {
 	case string:
-		if runtimeProtectedStringFields[strings.ToLower(strings.TrimSpace(fieldName))] {
+		if runtimeautovault.ProtectedStringField(fieldName) {
 			return
 		}
 		if skipHeuristic {
@@ -706,7 +680,7 @@ func (s *runtimeSecretScanner) collectAdjudicationTasks(value any, fieldName str
 			if runtimeautovault.LooksLikeShadow(candidate.Value) {
 				continue
 			}
-			if _, ok := s.lookupReusablePlaceholder(candidate.Value); ok {
+			if _, ok := s.lookupReusablePlaceholder(context.Background(), candidate.Value); ok {
 				continue
 			}
 			if highContextSecretField(fieldName) || secretContextHint(typed, candidate.Value) {
@@ -735,7 +709,7 @@ func (s *runtimeSecretScanner) collectAdjudicationTasks(value any, fieldName str
 			return
 		}
 		for k, v := range typed {
-			childSkip := skipHeuristic || (topLevel && runtimeNoiseSubtreeKeys[k])
+			childSkip := skipHeuristic || (topLevel && runtimeautovault.NoiseSubtreeKey(k))
 			s.collectAdjudicationTasks(v, k, false, childSkip, seen, out)
 		}
 	case []any:
@@ -807,7 +781,7 @@ func (s *runtimeSecretScanner) lookupOrAdjudicate(ctx context.Context, fieldName
 		return verdict, true
 	}
 	cfg := verificationConfig(s.hooks.Config)
-	if !cfg.Enabled || cfg.Endpoint == "" || cfg.Model == "" {
+	if !runtimeautovault.SecretAdjudicatorConfigured(cfg) {
 		return adjudicationVerdict{}, false
 	}
 	client := llm.NewClient(cfg.LLMProviderConfig).WithMaxTokens(250)
@@ -815,7 +789,7 @@ func (s *runtimeSecretScanner) lookupOrAdjudicate(ctx context.Context, fieldName
 	adjudicationCtx, cancel := context.WithTimeout(ctx, runtimeAdjudicationTimeout(cfg))
 	defer cancel()
 	raw, err := client.Complete(adjudicationCtx, []llm.ChatMessage{
-		{Role: "system", Content: runtimeSecretAdjudicatorSystemPrompt},
+		{Role: "system", Content: runtimeautovault.SecretAdjudicatorSystemPrompt},
 		{Role: "user", Content: buildSecretAdjudicatorPrompt(s.host, fieldName, content, candidate)},
 	})
 	duration := time.Since(adjudicateStartedAt)
@@ -867,14 +841,15 @@ func secretValueCacheKey(agentID, raw string) string {
 	return agentID + ":" + hex.EncodeToString(sum[:])
 }
 
-func captureRuntimeSecret(ctx context.Context, srv *Server, st store.Store, v vault.Vault, session *store.RuntimeSession, service, raw string) (string, error) {
-	if placeholder, ok := lookupRuntimeSecretPlaceholder(srv, session, raw); ok {
+func captureRuntimeSecret(ctx context.Context, srv *Server, st store.Store, v vault.Vault, session *store.RuntimeSession, host, service, raw string) (string, error) {
+	if placeholder, ok := lookupRuntimeSecretPlaceholder(ctx, srv, st, session, raw); ok {
 		return placeholder, nil
 	}
 	cacheKey := secretValueCacheKey(session.AgentID, raw)
 	if entry, ok := srv.sharedCapturedSecretGet(cacheKey); ok {
-		srv.secretValueCache.Store(cacheKey, entry)
-		return entry.Placeholder, nil
+		if placeholder, ok := validateCapturedSecretCacheEntry(ctx, srv, st, session, cacheKey, entry); ok {
+			return placeholder, nil
+		}
 	}
 	release := func() {}
 	if ok, unlock := srv.acquireCapturedSecretLock(cacheKey); ok {
@@ -884,8 +859,9 @@ func captureRuntimeSecret(ctx context.Context, srv *Server, st store.Store, v va
 		deadline := time.Now().UTC().Add(2 * time.Second)
 		for time.Now().UTC().Before(deadline) {
 			if entry, ok := srv.sharedCapturedSecretGet(cacheKey); ok {
-				srv.secretValueCache.Store(cacheKey, entry)
-				return entry.Placeholder, nil
+				if placeholder, ok := validateCapturedSecretCacheEntry(ctx, srv, st, session, cacheKey, entry); ok {
+					return placeholder, nil
+				}
 			}
 			time.Sleep(50 * time.Millisecond)
 		}
@@ -902,11 +878,34 @@ func captureRuntimeSecret(ctx context.Context, srv *Server, st store.Store, v va
 	if err := v.Set(ctx, session.UserID, serviceID, []byte(raw)); err != nil {
 		return "", err
 	}
+	grantID := uuid.NewString()
+	expiresAt := session.ExpiresAt
+	metadata, _ := json.Marshal(map[string]any{"source": "runtime_secret_capture"})
+	if err := st.CreateCredentialAuthorization(ctx, &store.CredentialAuthorization{
+		ID:            grantID,
+		UserID:        session.UserID,
+		AgentID:       session.AgentID,
+		SessionID:     &session.ID,
+		Scope:         "session",
+		CredentialRef: serviceID,
+		Service:       serviceID,
+		Host:          host,
+		HeaderName:    "authorization",
+		Scheme:        "bearer",
+		Status:        "active",
+		MetadataJSON:  metadata,
+		ExpiresAt:     &expiresAt,
+	}); err != nil {
+		return "", err
+	}
 	if err := st.CreateRuntimePlaceholder(ctx, &store.RuntimePlaceholder{
-		Placeholder: placeholder,
-		UserID:      session.UserID,
-		AgentID:     session.AgentID,
-		ServiceID:   serviceID,
+		Placeholder:       placeholder,
+		UserID:            session.UserID,
+		AgentID:           session.AgentID,
+		ServiceID:         serviceID,
+		VaultItemID:       serviceID,
+		CredentialGrantID: grantID,
+		ExpiresAt:         &expiresAt,
 	}); err != nil {
 		return "", err
 	}
@@ -919,7 +918,7 @@ func captureRuntimeSecret(ctx context.Context, srv *Server, st store.Store, v va
 	return placeholder, nil
 }
 
-func lookupRuntimeSecretPlaceholder(srv *Server, session *store.RuntimeSession, raw string) (string, bool) {
+func lookupRuntimeSecretPlaceholder(ctx context.Context, srv *Server, st store.Store, session *store.RuntimeSession, raw string) (string, bool) {
 	if srv == nil || session == nil {
 		return "", false
 	}
@@ -927,13 +926,41 @@ func lookupRuntimeSecretPlaceholder(srv *Server, session *store.RuntimeSession, 
 	value, ok := srv.secretValueCache.Load(cacheKey)
 	if !ok {
 		if entry, ok := srv.sharedCapturedSecretGet(cacheKey); ok {
-			srv.secretValueCache.Store(cacheKey, entry)
-			return entry.Placeholder, true
+			return validateCapturedSecretCacheEntry(ctx, srv, st, session, cacheKey, entry)
 		}
 		return "", false
 	}
 	entry, _ := value.(capturedSecretEntry)
-	return entry.Placeholder, entry.Placeholder != ""
+	return validateCapturedSecretCacheEntry(ctx, srv, st, session, cacheKey, entry)
+}
+
+func validateCapturedSecretCacheEntry(ctx context.Context, srv *Server, st store.Store, session *store.RuntimeSession, cacheKey string, entry capturedSecretEntry) (string, bool) {
+	if entry.Placeholder == "" || st == nil || session == nil {
+		return "", false
+	}
+	rec, err := st.GetRuntimePlaceholder(ctx, entry.Placeholder)
+	if err != nil {
+		if srv != nil {
+			srv.secretValueCache.Delete(cacheKey)
+		}
+		return "", false
+	}
+	if entry.ServiceID != "" && rec.ServiceID != entry.ServiceID {
+		if srv != nil {
+			srv.secretValueCache.Delete(cacheKey)
+		}
+		return "", false
+	}
+	if _, ok := llmproxy.ValidateRuntimePlaceholderAccess(ctx, st, rec, session.UserID, session.AgentID, time.Now().UTC()); !ok {
+		if srv != nil {
+			srv.secretValueCache.Delete(cacheKey)
+		}
+		return "", false
+	}
+	if srv != nil {
+		srv.secretValueCache.Store(cacheKey, entry)
+	}
+	return entry.Placeholder, true
 }
 
 var knownProtocolNoisePrefixes = []string{
@@ -967,216 +994,55 @@ var (
 // UUIDs in file paths, vite-style chunked filenames, JS identifiers, and
 // all-caps env-var names. None of those are secrets.
 func looksObviouslyNonSecret(candidate string) bool {
-	if candidate == "" {
-		return false
-	}
-	for _, prefix := range knownProtocolNoisePrefixes {
-		if strings.HasPrefix(candidate, prefix) {
-			return true
-		}
-	}
-	if strings.Contains(candidate, "__") {
-		// CSS BEM separator — class names like wp-block-button__width-25.
-		return true
-	}
-	if uuidCandidateRe.MatchString(candidate) {
-		return true
-	}
-	if fileExtensionInValueRe.MatchString(candidate) {
-		return true
-	}
-	if allCapsConstantRe.MatchString(candidate) {
-		return true
-	}
-	// Vite/webpack/rollup chunk pattern: <name>-<8 alnum/sep>. The detector
-	// surfaces these because they're high-entropy, but they're filenames.
-	if bundlerChunkSuffixRe.MatchString(candidate) && !strings.Contains(candidate, "_") {
-		// Only suppress when the prefix looks like a kebab identifier so we
-		// don't accidentally drop `sk-ant-…`-style keys.
-		dashIdx := strings.LastIndex(candidate, "-")
-		if dashIdx > 0 {
-			prefix := candidate[:dashIdx]
-			if isKebabIdentifier(prefix) {
-				return true
-			}
-		}
-	}
-	// Camel/Pascal-case identifier with no separators (AbstractAsyncHooksContextManager).
-	if jsIdentifierRe.MatchString(candidate) && hasMixedCase(candidate) && !hasDigit(candidate) {
-		return true
-	}
-	return false
+	return runtimeautovault.LooksObviouslyNonSecret(candidate)
 }
 
 func isKebabIdentifier(s string) bool {
-	if s == "" {
-		return false
-	}
-	for i := 0; i < len(s); i++ {
-		c := s[i]
-		switch {
-		case c >= 'a' && c <= 'z':
-		case c >= 'A' && c <= 'Z':
-		case c >= '0' && c <= '9':
-		case c == '-':
-		default:
-			return false
-		}
-	}
-	return true
+	return runtimeautovault.IsKebabIdentifier(s)
 }
 
 func hasMixedCase(s string) bool {
-	hasLower, hasUpper := false, false
-	for i := 0; i < len(s); i++ {
-		c := s[i]
-		if c >= 'a' && c <= 'z' {
-			hasLower = true
-		} else if c >= 'A' && c <= 'Z' {
-			hasUpper = true
-		}
-		if hasLower && hasUpper {
-			return true
-		}
-	}
-	return false
+	return runtimeautovault.HasMixedCase(s)
 }
 
 func hasDigit(s string) bool {
-	for i := 0; i < len(s); i++ {
-		if s[i] >= '0' && s[i] <= '9' {
-			return true
-		}
-	}
-	return false
+	return runtimeautovault.HasDigit(s)
 }
 
 func adjudicationCacheKey(host, fieldName, charset, contextWindow string) string {
-	sum := sha256.Sum256([]byte(strings.ToLower(host) + "\n" + strings.ToLower(fieldName) + "\n" + charset + "\n" + contextWindow))
-	return hex.EncodeToString(sum[:])
+	return runtimeautovault.AdjudicationCacheKey(host, fieldName, charset, contextWindow)
 }
 
 func prefixRegexFor(prefix string) *regexp.Regexp {
-	return regexp.MustCompile(regexp.QuoteMeta(prefix) + `[A-Za-z0-9_-]{4,}`)
+	return runtimeautovault.PrefixRegexFor(prefix)
 }
 
 func highContextSecretField(fieldName string) bool {
-	field := strings.ToLower(strings.TrimSpace(fieldName))
-	for _, token := range []string{"api_key", "apikey", "access_token", "token", "authorization", "auth", "secret", "password", "passcode"} {
-		if field == token || strings.Contains(field, token) {
-			return true
-		}
-	}
-	return false
+	return runtimeautovault.HighContextSecretField(fieldName)
 }
 
 func secretContextHint(content, candidate string) bool {
-	lower := strings.ToLower(content)
-	lower = strings.ReplaceAll(lower, candidate, "<candidate>")
-	for _, hint := range []string{"api key", "access token", "authorization", "bearer", "password", "secret", "token"} {
-		if strings.Contains(lower, hint) {
-			return true
-		}
-	}
-	return false
+	return runtimeautovault.SecretContextHint(content, candidate)
 }
 
 func guessService(fieldName, content string) string {
-	lower := strings.ToLower(fieldName + " " + content)
-	for _, spec := range knownPrefixSpecs {
-		if strings.Contains(lower, spec.Service) {
-			return spec.Service
-		}
-	}
-	return "captured"
+	return runtimeautovault.GuessService(fieldName, content)
 }
 
 func normalizeSecretService(value string) string {
-	value = strings.ToLower(strings.TrimSpace(value))
-	value = strings.ReplaceAll(value, " ", "_")
-	value = strings.ReplaceAll(value, "/", "_")
-	value = strings.ReplaceAll(value, ".", "_")
-	if value == "" {
-		return ""
-	}
-	return value
+	return runtimeautovault.NormalizeSecretService(value)
 }
 
 func redactedCandidateContext(content, candidate string) string {
-	return strings.ReplaceAll(content, candidate, "<TOKEN_CANDIDATE_1>")
+	return runtimeautovault.RedactedCandidateContext(content, candidate)
 }
 
 func buildSecretAdjudicatorPrompt(host, fieldName, content string, candidate runtimeautovault.Candidate) string {
-	return fmt.Sprintf(`Host: %s
-Field: %s
-Candidate charset: %s
-Candidate entropy: %.2f
-Redacted context:
-%s
-
-Decide whether <TOKEN_CANDIDATE_1> is a real credential that should be captured for later placeholder swap. Return strict JSON:
-{"credential":true|false,"service":"service-name-or-empty","confidence":0.0-1.0}`,
-		host,
-		fieldName,
-		candidate.Charset,
-		candidate.Entropy,
-		redactedCandidateContext(content, candidate.Value),
-	)
+	return runtimeautovault.BuildSecretAdjudicatorPrompt(host, fieldName, content, candidate)
 }
 
 func parseSecretAdjudicatorVerdict(raw string) (adjudicationVerdict, error) {
-	body := extractFirstJSONObject(raw)
-	if body == "" {
-		return adjudicationVerdict{}, fmt.Errorf("no JSON object found in adjudicator response")
-	}
-	var verdict adjudicationVerdict
-	if err := json.Unmarshal([]byte(body), &verdict); err != nil {
-		return adjudicationVerdict{}, err
-	}
-	return verdict, nil
-}
-
-// extractFirstJSONObject returns the substring spanning the first balanced
-// {...} block in s, ignoring braces that appear inside strings. Handles
-// markdown-fenced replies, trailing prose, and prefix commentary that the
-// adjudicator LLM occasionally emits.
-func extractFirstJSONObject(s string) string {
-	start := strings.IndexByte(s, '{')
-	if start < 0 {
-		return ""
-	}
-	depth := 0
-	inString := false
-	escaped := false
-	for i := start; i < len(s); i++ {
-		c := s[i]
-		if inString {
-			if escaped {
-				escaped = false
-				continue
-			}
-			if c == '\\' {
-				escaped = true
-				continue
-			}
-			if c == '"' {
-				inString = false
-			}
-			continue
-		}
-		switch c {
-		case '"':
-			inString = true
-		case '{':
-			depth++
-		case '}':
-			depth--
-			if depth == 0 {
-				return s[start : i+1]
-			}
-		}
-	}
-	return ""
+	return runtimeautovault.ParseSecretAdjudicatorVerdict(raw)
 }
 
 func verificationConfig(cfg *config.Config) config.VerificationConfig {
@@ -1187,10 +1053,7 @@ func verificationConfig(cfg *config.Config) config.VerificationConfig {
 }
 
 func runtimeAdjudicationTimeout(cfg config.VerificationConfig) time.Duration {
-	if cfg.TimeoutSeconds > 0 {
-		return time.Duration(cfg.TimeoutSeconds) * time.Second
-	}
-	return defaultRuntimeAdjudicationTimeout
+	return runtimeautovault.SecretAdjudicationTimeout(cfg)
 }
 
 func stringValueFromMap(m map[string]any, key string) string {
@@ -1210,12 +1073,3 @@ func runtimeConversationHost(req *http.Request) bool {
 		return false
 	}
 }
-
-const runtimeSecretAdjudicatorSystemPrompt = `You classify redacted candidate strings inside LLM conversation requests.
-
-Rules:
-- The candidate value is always redacted as <TOKEN_CANDIDATE_1>.
-- Decide whether it is likely a real credential or secret that should be captured and replaced with a placeholder.
-- Prefer false when the context is weak or the value looks like an ordinary identifier.
-- Return strict JSON only:
-  {"credential":true|false,"service":"service-name-or-empty","confidence":0.0-1.0}`

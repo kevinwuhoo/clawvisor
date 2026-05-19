@@ -1,4 +1,4 @@
-import { useMemo, useState } from 'react'
+import { useEffect, useMemo, useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { api, type Agent, type ApprovalRecord, type RuntimeEvent, type RuntimePolicyRule, type RuntimeStatus, type RuntimeSession, type StarterProfile } from '../api/client'
 
@@ -45,6 +45,7 @@ export default function Runtime() {
   const qc = useQueryClient()
   const [agentFilter, setAgentFilter] = useState<string>('all')
   const [editingRule, setEditingRule] = useState<RuleDraft | null>(null)
+  const [runtimeError, setRuntimeError] = useState<string | null>(null)
 
   const { data: agents = [] } = useQuery({
     queryKey: ['agents'],
@@ -54,32 +55,40 @@ export default function Runtime() {
     queryKey: ['runtime-status'],
     queryFn: () => api.runtime.status(),
   })
+  const fullProxyActive = !!status?.enabled
+  const proxyLiteActive = !!status?.proxy_lite_enabled
   const { data: sessions } = useQuery({
     queryKey: ['runtime-sessions'],
     queryFn: () => api.runtime.listSessions(),
+    enabled: fullProxyActive,
     refetchInterval: 15_000,
   })
   const { data: approvals } = useQuery({
     queryKey: ['runtime-approvals'],
     queryFn: () => api.runtime.listApprovals(),
+    enabled: fullProxyActive,
     refetchInterval: 10_000,
   })
   const { data: events } = useQuery({
     queryKey: ['runtime-events'],
     queryFn: () => api.runtime.listEvents(),
+    enabled: fullProxyActive,
     refetchInterval: 10_000,
   })
   const { data: egressRules } = useQuery({
     queryKey: ['runtime-rules', 'egress', agentFilter],
     queryFn: () => api.runtime.listRules({ kind: 'egress', agent_id: agentFilter === 'all' ? undefined : agentFilter }),
+    enabled: fullProxyActive,
   })
   const { data: toolRules } = useQuery({
     queryKey: ['runtime-rules', 'tool', agentFilter],
     queryFn: () => api.runtime.listRules({ kind: 'tool', agent_id: agentFilter === 'all' ? undefined : agentFilter }),
+    enabled: fullProxyActive,
   })
   const { data: starterProfiles } = useQuery({
     queryKey: ['runtime-starter-profiles'],
     queryFn: () => api.runtime.listStarterProfiles(),
+    enabled: fullProxyActive,
   })
 
   const agentMap = useMemo(() => new Map(agents.map(agent => [agent.id, agent])), [agents])
@@ -120,6 +129,23 @@ export default function Runtime() {
       api.runtime.promoteEventToTask(eventId, lifetime),
     onSuccess: refreshRuntime,
   })
+  const enablePassthroughMut = useMutation({
+    mutationFn: (body: { agent_id?: string; ttl_seconds?: number; indefinite?: boolean; reason?: string; confirmation_text?: string }) =>
+      api.runtime.enablePassthrough(body),
+    onSuccess: () => {
+      setRuntimeError(null)
+      refreshRuntime()
+    },
+    onError: (err: Error) => setRuntimeError(err.message),
+  })
+  const disablePassthroughMut = useMutation({
+    mutationFn: (ruleId?: string) => api.runtime.disablePassthrough(ruleId),
+    onSuccess: () => {
+      setRuntimeError(null)
+      refreshRuntime()
+    },
+    onError: (err: Error) => setRuntimeError(err.message),
+  })
 
   const startCreateRule = (kind: 'egress' | 'tool') => {
     setEditingRule(kind === 'egress' ? emptyEgressRule() : emptyToolRule())
@@ -149,21 +175,34 @@ export default function Runtime() {
         </div>
       </div>
 
-      {status && (
+      {runtimeError && (
+        <div className="rounded border border-danger/30 bg-danger/10 px-4 py-3 text-sm text-danger">
+          {runtimeError}
+        </div>
+      )}
+
+      {status && fullProxyActive && (
         <RuntimeStatusPanel
           status={status}
           activeSessionCount={(sessions?.entries ?? []).filter(isActiveRuntimeSession).length}
+          agents={agents}
+          selectedAgentId={agentFilter === 'all' ? '' : agentFilter}
+          busy={proxyLiteActive && (enablePassthroughMut.isPending || disablePassthroughMut.isPending)}
+          onEnablePassthrough={proxyLiteActive ? (body) => enablePassthroughMut.mutate(body) : undefined}
+          onDisablePassthrough={proxyLiteActive ? (ruleId) => disablePassthroughMut.mutate(ruleId) : undefined}
         />
       )}
 
-      <StarterProfilesPanel
-        profiles={starterProfiles?.entries ?? []}
-        agents={agents}
-        agentFilter={agentFilter}
-        onApplied={refreshRuntime}
-      />
+      {fullProxyActive && (
+        <StarterProfilesPanel
+          profiles={starterProfiles?.entries ?? []}
+          agents={agents}
+          agentFilter={agentFilter}
+          onApplied={refreshRuntime}
+        />
+      )}
 
-      {editingRule && (
+      {fullProxyActive && editingRule && (
         <RuleEditorCard
           key={editingRule.id ?? `${editingRule.kind}-${editingRule.action}-${editingRule.host ?? editingRule.tool_name ?? 'new'}`}
           agents={agents}
@@ -177,50 +216,84 @@ export default function Runtime() {
         />
       )}
 
-      <RuleSection
-        title="Global Egress Rules"
-        subtitle="Fast-path controls for background and harness HTTP noise."
-        rules={egressRules?.entries ?? []}
-        agents={agentMap}
-        onNew={() => startCreateRule('egress')}
-        onEdit={setEditingRule}
-        onToggle={(rule) => updateRuleMut.mutate({ ...rule, scope: rule.agent_id ? 'agent' : 'global', enabled: !rule.enabled })}
-        onDelete={(rule) => deleteRuleMut.mutate(rule.id)}
-      />
+      {fullProxyActive && (
+        <>
+          <RuleSection
+            title="Global Egress Rules"
+            subtitle="Fast-path controls for background and harness HTTP noise."
+            rules={egressRules?.entries ?? []}
+            agents={agentMap}
+            onNew={() => startCreateRule('egress')}
+            onEdit={setEditingRule}
+            onToggle={(rule) => updateRuleMut.mutate({ ...rule, scope: rule.agent_id ? 'agent' : 'global', enabled: !rule.enabled })}
+            onDelete={(rule) => deleteRuleMut.mutate(rule.id)}
+          />
 
-      <RuleSection
-        title="Global Tool Rules"
-        subtitle="Allow, review, or deny repeated tool-use patterns before they hit task friction."
-        rules={toolRules?.entries ?? []}
-        agents={agentMap}
-        onNew={() => startCreateRule('tool')}
-        onEdit={setEditingRule}
-        onToggle={(rule) => updateRuleMut.mutate({ ...rule, scope: rule.agent_id ? 'agent' : 'global', enabled: !rule.enabled })}
-        onDelete={(rule) => deleteRuleMut.mutate(rule.id)}
-      />
+          <RuleSection
+            title="Global Tool Rules"
+            subtitle="Allow, review, or deny repeated tool-use patterns before they hit task friction."
+            rules={toolRules?.entries ?? []}
+            agents={agentMap}
+            onNew={() => startCreateRule('tool')}
+            onEdit={setEditingRule}
+            onToggle={(rule) => updateRuleMut.mutate({ ...rule, scope: rule.agent_id ? 'agent' : 'global', enabled: !rule.enabled })}
+            onDelete={(rule) => deleteRuleMut.mutate(rule.id)}
+          />
 
-      <RuntimeApprovalsPanel approvals={liveApprovals} onResolved={refreshRuntime} />
+          <RuntimeApprovalsPanel approvals={liveApprovals} onResolved={refreshRuntime} />
 
-      <RuntimeSessionsPanel sessions={sessions?.entries ?? []} agents={agentMap} onUpdated={refreshRuntime} />
+          <RuntimeSessionsPanel sessions={sessions?.entries ?? []} agents={agentMap} onUpdated={refreshRuntime} />
 
-      <RuntimeEventsPanel
-        events={events?.entries ?? []}
-        agents={agentMap}
-        onResolved={refreshRuntime}
-        onEditRule={async (event, action) => {
-          const candidate = await api.runtime.getRuleCandidate(event.id, action)
-          setEditingRule({
-            ...candidate.rule,
-            scope: candidate.scope_default,
-          })
-        }}
-        onPromoteTask={(eventId, lifetime) => promoteTaskMut.mutate({ eventId, lifetime })}
-      />
+          <RuntimeEventsPanel
+            events={events?.entries ?? []}
+            agents={agentMap}
+            onResolved={refreshRuntime}
+            onEditRule={async (event, action) => {
+              const candidate = await api.runtime.getRuleCandidate(event.id, action)
+              setEditingRule({
+                ...candidate.rule,
+                scope: candidate.scope_default,
+              })
+            }}
+            onPromoteTask={(eventId, lifetime) => promoteTaskMut.mutate({ eventId, lifetime })}
+          />
+        </>
+      )}
     </div>
   )
 }
 
-export function RuntimeStatusPanel({ status, activeSessionCount }: { status: RuntimeStatus; activeSessionCount: number }) {
+export function RuntimeStatusPanel({
+  status,
+  activeSessionCount,
+  agents = [],
+  selectedAgentId = '',
+  busy = false,
+  onEnablePassthrough,
+  onDisablePassthrough,
+}: {
+  status: RuntimeStatus
+  activeSessionCount: number
+  agents?: Agent[]
+  selectedAgentId?: string
+  busy?: boolean
+  onEnablePassthrough?: (body: { agent_id?: string; ttl_seconds?: number; indefinite?: boolean; reason?: string; confirmation_text?: string }) => void
+  onDisablePassthrough?: (ruleId?: string) => void
+}) {
+  const [duration, setDuration] = useState('600')
+  const [scope, setScope] = useState(selectedAgentId || '')
+  const [confirmIndefinite, setConfirmIndefinite] = useState(false)
+  const [confirmGlobal, setConfirmGlobal] = useState(false)
+  const passthrough = status.passthrough
+  const proxyLiteActive = !!status.proxy_lite_enabled
+  const passthroughActive = !!passthrough?.enabled
+  const canControl = !!onEnablePassthrough && !!onDisablePassthrough
+  const ttlSeconds = duration === 'indefinite' ? undefined : Number(duration)
+  useEffect(() => {
+    setScope(selectedAgentId || '')
+    setConfirmGlobal(false)
+  }, [selectedAgentId])
+  const globalScope = scope === ''
   return (
     <section className="rounded-md border border-border-default bg-surface-1 p-5 space-y-4">
       <div className="flex flex-wrap items-center justify-between gap-3">
@@ -235,6 +308,11 @@ export function RuntimeStatusPanel({ status, activeSessionCount }: { status: Run
           <span className="rounded bg-surface-2 px-2.5 py-1 text-text-secondary">
             {activeSessionCount} active session{activeSessionCount === 1 ? '' : 's'}
           </span>
+          {proxyLiteActive && (
+            <span className={`rounded px-2.5 py-1 ${passthroughActive ? 'bg-warning/15 text-warning' : 'bg-surface-2 text-text-tertiary'}`}>
+              {passthroughActive ? 'passthrough active' : 'passthrough off'}
+            </span>
+          )}
         </div>
       </div>
       <div className="grid gap-3 md:grid-cols-4">
@@ -247,6 +325,87 @@ export function RuntimeStatusPanel({ status, activeSessionCount }: { status: Run
         <div className="rounded border border-border-subtle bg-surface-0 p-3">
           <div className="text-xs uppercase tracking-wider text-text-tertiary">Proxy endpoint</div>
           <code className="mt-1 block text-xs text-text-primary break-all">{status.proxy_url}</code>
+        </div>
+      )}
+      {proxyLiteActive && canControl && (
+        <div className="rounded border border-warning/30 bg-warning/5 p-4 space-y-3">
+          <div className="flex flex-wrap items-start justify-between gap-3">
+            <div>
+              <div className="text-sm font-medium text-text-primary">Break-glass passthrough</div>
+              <div className="text-xs text-text-tertiary mt-1">
+                Temporarily stop proxy-lite intervention while keeping best-effort audit.
+              </div>
+              {passthroughActive && (
+                <div className="mt-2 text-xs text-warning">
+                  Active{passthrough.agent_id ? ` for ${agents.find(a => a.id === passthrough.agent_id)?.name ?? 'selected agent'}` : ' for all agents'}
+                  {passthrough.expires_at ? ` until ${new Date(passthrough.expires_at).toLocaleString()}` : ' indefinitely'}.
+                </div>
+              )}
+            </div>
+            {passthroughActive ? (
+              <button
+                disabled={busy}
+                onClick={() => onDisablePassthrough?.(passthrough.rule_id)}
+                className="rounded border border-warning/40 px-4 py-2 text-sm font-medium text-warning hover:bg-warning/10 disabled:opacity-50"
+              >
+                Disable passthrough
+              </button>
+            ) : (
+              <div className="flex flex-wrap items-center gap-2">
+                <select
+                  value={scope}
+                  onChange={e => {
+                    setScope(e.target.value)
+                    setConfirmGlobal(false)
+                  }}
+                  className="rounded border border-border-default bg-surface-0 px-3 py-2 text-sm text-text-primary"
+                >
+                  <option value="">All agents</option>
+                  {agents.map(agent => (
+                    <option key={agent.id} value={agent.id}>{agent.name}</option>
+                  ))}
+                </select>
+                <select
+                  value={duration}
+                  onChange={e => {
+                    setDuration(e.target.value)
+                    if (e.target.value !== 'indefinite') setConfirmIndefinite(false)
+                  }}
+                  className="rounded border border-border-default bg-surface-0 px-3 py-2 text-sm text-text-primary"
+                >
+                  <option value="600">10 minutes</option>
+                  <option value="3600">1 hour</option>
+                  <option value="172800">2 days</option>
+                  <option value="indefinite">Indefinite</option>
+                </select>
+                {duration === 'indefinite' && (
+                  <label className="flex items-center gap-2 text-xs text-text-secondary">
+                    <input type="checkbox" checked={confirmIndefinite} onChange={e => setConfirmIndefinite(e.target.checked)} />
+                    Confirm indefinite
+                  </label>
+                )}
+                {globalScope && (
+                  <label className="flex items-center gap-2 text-xs text-text-secondary">
+                    <input type="checkbox" checked={confirmGlobal} onChange={e => setConfirmGlobal(e.target.checked)} />
+                    Confirm all agents
+                  </label>
+                )}
+                <button
+                  disabled={busy || (duration === 'indefinite' && !confirmIndefinite) || (globalScope && !confirmGlobal)}
+                  onClick={() => onEnablePassthrough?.({
+                    agent_id: scope || undefined,
+                    ttl_seconds: ttlSeconds,
+                    indefinite: duration === 'indefinite',
+                    confirmation_text: globalScope ? 'enable global passthrough' : duration === 'indefinite' ? 'enable passthrough' : undefined,
+                    reason: 'dashboard break-glass passthrough',
+                  })}
+                  className="rounded bg-warning px-4 py-2 text-sm font-medium text-surface-0 hover:bg-warning/90 disabled:opacity-50"
+                >
+                  Enable
+                </button>
+              </div>
+            )}
+          </div>
         </div>
       )}
     </section>
@@ -411,21 +570,97 @@ export function RuleSection({
   )
 }
 
+function RadioGroup({
+  options,
+  value,
+  onChange,
+}: {
+  options: Array<{ value: string; label: string }>
+  value: string
+  onChange: (value: string) => void
+}) {
+  return (
+    // Use aria-pressed (toggle-button semantics) rather than role="radio",
+    // which would require a surrounding role="radiogroup" container and
+    // arrow-key navigation we don't implement.
+    <div className="inline-flex rounded-md border border-border-default bg-surface-0 p-1">
+      {options.map(option => {
+        const active = value === option.value
+        return (
+          <button
+            key={option.value}
+            type="button"
+            aria-pressed={active}
+            onClick={() => onChange(option.value)}
+            className={`rounded px-3 py-1.5 text-sm font-medium transition ${
+              active
+                ? 'bg-surface-1 text-text-primary shadow-sm'
+                : 'text-text-tertiary hover:text-text-primary'
+            }`}
+          >
+            {option.label}
+          </button>
+        )
+      })}
+    </div>
+  )
+}
+
 export function RuleEditorCard({
   agents,
   draft,
   busy,
+  allowedKinds = ['egress', 'tool'],
+  defaultAgentId,
+  agentScopeLabel = 'One agent',
+  toolNameOptions = [],
   onCancel,
   onSave,
 }: {
   agents: Agent[]
   draft: RuleDraft
   busy: boolean
+  allowedKinds?: Array<'egress' | 'tool'>
+  defaultAgentId?: string
+  agentScopeLabel?: string
+  toolNameOptions?: string[]
   onCancel: () => void
   onSave: (draft: RuleDraft) => void
 }) {
-  const [local, setLocal] = useState<RuleDraft>(draft)
+  const initialDraft = useMemo(() => {
+    const next = { ...draft }
+    if (!allowedKinds.includes(next.kind as 'egress' | 'tool')) {
+      next.kind = allowedKinds[0]
+    }
+    if ((next.scope ?? 'agent') === 'agent' && !next.agent_id && defaultAgentId) {
+      next.agent_id = defaultAgentId
+    }
+    return next
+  }, [allowedKinds, defaultAgentId, draft])
+  const [local, setLocal] = useState<RuleDraft>(initialDraft)
+  const normalizedToolOptions = useMemo(() => {
+    const names = new Set<string>()
+    for (const name of toolNameOptions) {
+      const trimmed = name.trim()
+      if (trimmed) names.add(trimmed)
+    }
+    if (local.tool_name?.trim()) names.add(local.tool_name.trim())
+    return Array.from(names).sort((a, b) => a.localeCompare(b))
+  }, [local.tool_name, toolNameOptions])
+  const [toolNameMode, setToolNameMode] = useState<'known' | 'other'>(
+    local.tool_name && normalizedToolOptions.length > 0 && !normalizedToolOptions.includes(local.tool_name) ? 'other' : 'known',
+  )
   const update = (patch: Partial<RuleDraft>) => setLocal(current => ({ ...current, ...patch }))
+  const actionOptions: Array<{ value: 'allow' | 'review' | 'deny'; label: string }> = [
+    { value: 'allow', label: 'Allow' },
+    { value: 'review', label: 'Review' },
+    { value: 'deny', label: 'Deny' },
+  ]
+  const regexExamples = [
+    { label: 'Secrets', value: '(?i)(password|secret|token|api[_-]?key)' },
+    { label: 'Dangerous shell', value: '(^|\\s)(rm\\s+-rf|sudo|chmod\\s+777)(\\s|$)' },
+    { label: 'Dotenv files', value: '(^|/)\\.env(\\.|$|\\s)' },
+  ]
 
   return (
     <section className="rounded-md border border-brand/30 bg-surface-1 p-5 space-y-4">
@@ -438,27 +673,57 @@ export function RuleEditorCard({
           Cancel
         </button>
       </div>
-      <div className="grid gap-3 md:grid-cols-4">
-        <select value={local.kind ?? 'egress'} onChange={e => update({ kind: e.target.value as 'egress' | 'tool' })} className="rounded border border-border-default bg-surface-0 px-3 py-2 text-sm text-text-primary">
-          <option value="egress">Egress</option>
-          <option value="tool">Tool</option>
-        </select>
-        <select value={local.action ?? 'allow'} onChange={e => update({ action: e.target.value as 'allow' | 'deny' | 'review' })} className="rounded border border-border-default bg-surface-0 px-3 py-2 text-sm text-text-primary">
-          <option value="allow">Allow</option>
-          <option value="review">Review</option>
-          <option value="deny">Deny</option>
-        </select>
-        <select value={local.scope ?? 'agent'} onChange={e => update({ scope: e.target.value as 'agent' | 'global' })} className="rounded border border-border-default bg-surface-0 px-3 py-2 text-sm text-text-primary">
-          <option value="agent">This agent</option>
-          <option value="global">All agents</option>
-        </select>
-        <select value={local.agent_id ?? ''} onChange={e => update({ agent_id: e.target.value || undefined })} disabled={local.scope === 'global'} className="rounded border border-border-default bg-surface-0 px-3 py-2 text-sm text-text-primary disabled:opacity-50">
-          <option value="">Choose agent</option>
-          {agents.map(agent => (
-            <option key={agent.id} value={agent.id}>{agent.name}</option>
-          ))}
-        </select>
+      {allowedKinds.length > 1 && (
+        <fieldset className="space-y-2">
+          <legend className="text-xs font-medium uppercase tracking-wider text-text-tertiary">Rule type</legend>
+          <RadioGroup
+            options={[
+              { value: 'egress', label: 'Egress' },
+              { value: 'tool', label: 'Tool' },
+            ].filter(option => allowedKinds.includes(option.value as 'egress' | 'tool'))}
+            value={local.kind ?? allowedKinds[0]}
+            onChange={value => update({ kind: value as 'egress' | 'tool' })}
+          />
+        </fieldset>
+      )}
+      <div className="grid gap-4 md:grid-cols-2">
+        <fieldset className="space-y-2">
+          <legend className="text-xs font-medium uppercase tracking-wider text-text-tertiary">Decision</legend>
+          <RadioGroup
+            options={actionOptions}
+            value={local.action ?? 'allow'}
+            onChange={value => update({ action: value as 'allow' | 'review' | 'deny' })}
+          />
+        </fieldset>
+        <fieldset className="space-y-2">
+          <legend className="text-xs font-medium uppercase tracking-wider text-text-tertiary">Applies to</legend>
+          <RadioGroup
+            options={[
+              { value: 'agent', label: agentScopeLabel },
+              { value: 'global', label: 'All agents' },
+            ]}
+            value={local.scope ?? 'agent'}
+            onChange={value => {
+              const scope = value as 'agent' | 'global'
+              update({
+                scope,
+                agent_id: scope === 'global' ? undefined : (local.agent_id || defaultAgentId),
+              })
+            }}
+          />
+        </fieldset>
       </div>
+      {(local.scope ?? 'agent') === 'agent' && (
+        <div className="max-w-md space-y-2">
+          <label className="text-xs font-medium uppercase tracking-wider text-text-tertiary">Agent</label>
+          <select value={local.agent_id ?? ''} onChange={e => update({ agent_id: e.target.value || undefined })} className="w-full rounded border border-border-default bg-surface-0 px-3 py-2 text-sm text-text-primary">
+            <option value="">Choose agent</option>
+            {agents.map(agent => (
+              <option key={agent.id} value={agent.id}>{agent.name}</option>
+            ))}
+          </select>
+        </div>
+      )}
       {local.kind === 'egress' ? (
         <div className="grid gap-3 md:grid-cols-3">
           <input value={local.host ?? ''} onChange={e => update({ host: e.target.value })} placeholder="host" className="rounded border border-border-default bg-surface-0 px-3 py-2 text-sm text-text-primary" />
@@ -468,8 +733,54 @@ export function RuleEditorCard({
         </div>
       ) : (
         <div className="grid gap-3 md:grid-cols-2">
-          <input value={local.tool_name ?? ''} onChange={e => update({ tool_name: e.target.value })} placeholder="tool name" className="rounded border border-border-default bg-surface-0 px-3 py-2 text-sm text-text-primary" />
-          <input value={local.input_regex ?? ''} onChange={e => update({ input_regex: e.target.value })} placeholder="optional input regex" className="rounded border border-border-default bg-surface-0 px-3 py-2 text-sm text-text-primary" />
+          <div className="space-y-2">
+            <label className="text-xs font-medium uppercase tracking-wider text-text-tertiary">Tool name</label>
+            {normalizedToolOptions.length > 0 && toolNameMode === 'known' ? (
+              <select
+                value={local.tool_name ?? ''}
+                onChange={e => {
+                  if (e.target.value === '__other__') {
+                    setToolNameMode('other')
+                    update({ tool_name: '' })
+                    return
+                  }
+                  update({ tool_name: e.target.value })
+                }}
+                className="w-full rounded border border-border-default bg-surface-0 px-3 py-2 text-sm text-text-primary"
+              >
+                <option value="">Choose tool</option>
+                {normalizedToolOptions.map(name => (
+                  <option key={name} value={name}>{name}</option>
+                ))}
+                <option value="__other__">Other...</option>
+              </select>
+            ) : (
+              <div className="flex gap-2">
+                <input value={local.tool_name ?? ''} onChange={e => update({ tool_name: e.target.value })} placeholder="Tool name" className="min-w-0 flex-1 rounded border border-border-default bg-surface-0 px-3 py-2 text-sm text-text-primary" />
+                {normalizedToolOptions.length > 0 && (
+                  <button type="button" onClick={() => setToolNameMode('known')} className="rounded border border-border-default px-3 py-2 text-sm text-text-secondary hover:bg-surface-2">
+                    Pick
+                  </button>
+                )}
+              </div>
+            )}
+          </div>
+          <div className="space-y-2">
+            <label className="text-xs font-medium uppercase tracking-wider text-text-tertiary">Input regex</label>
+            <input value={local.input_regex ?? ''} onChange={e => update({ input_regex: e.target.value })} placeholder="Optional input regex" className="w-full rounded border border-border-default bg-surface-0 px-3 py-2 text-sm text-text-primary" />
+            <div className="flex flex-wrap gap-2">
+              {regexExamples.map(example => (
+                <button
+                  key={example.label}
+                  type="button"
+                  onClick={() => update({ input_regex: example.value })}
+                  className="rounded border border-border-subtle px-2.5 py-1 text-xs text-text-tertiary hover:bg-surface-2 hover:text-text-primary"
+                >
+                  {example.label}
+                </button>
+              ))}
+            </div>
+          </div>
         </div>
       )}
       <textarea value={local.reason ?? ''} onChange={e => update({ reason: e.target.value })} placeholder="Short reason / note" className="min-h-[88px] w-full rounded border border-border-default bg-surface-0 px-3 py-2 text-sm text-text-primary" />

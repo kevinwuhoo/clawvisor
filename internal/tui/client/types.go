@@ -63,6 +63,13 @@ type AgentRuntimeSettings struct {
 	UpdatedAt              time.Time `json:"updated_at"`
 }
 
+type LLMCredentialSetResponse struct {
+	Provider  string `json:"provider"`
+	ServiceID string `json:"service_id"`
+	Status    string `json:"status"`
+	AgentID   string `json:"agent_id,omitempty"`
+}
+
 type RuntimePolicyRule struct {
 	ID            string         `json:"id"`
 	UserID        string         `json:"user_id"`
@@ -183,8 +190,8 @@ type Task struct {
 	Status                 string           `json:"status"`
 	AuthorizedActions      []TaskAction     `json:"authorized_actions"`
 	PlannedCalls           []PlannedCall    `json:"planned_calls,omitempty"`
-	ExpectedTools          []ExpectedTool   `json:"expected_tools_json,omitempty"`
-	ExpectedEgress         []ExpectedEgress `json:"expected_egress_json,omitempty"`
+	ExpectedTools          []ExpectedTool   `json:"expected_tools,omitempty"`
+	ExpectedEgress         []ExpectedEgress `json:"expected_egress,omitempty"`
 	IntentVerificationMode string           `json:"intent_verification_mode,omitempty"`
 	ExpectedUse            string           `json:"expected_use,omitempty"`
 	SchemaVersion          int              `json:"schema_version,omitempty"`

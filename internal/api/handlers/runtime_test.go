@@ -12,12 +12,12 @@ import (
 	"time"
 
 	"github.com/clawvisor/clawvisor/internal/api/middleware"
+	"github.com/clawvisor/clawvisor/pkg/config"
 	runtimeproxy "github.com/clawvisor/clawvisor/pkg/runtime/proxy"
 	runtimereview "github.com/clawvisor/clawvisor/pkg/runtime/review"
+	"github.com/clawvisor/clawvisor/pkg/store"
 	"github.com/clawvisor/clawvisor/pkg/store/sqlite"
 	intvault "github.com/clawvisor/clawvisor/pkg/vault"
-	"github.com/clawvisor/clawvisor/pkg/config"
-	"github.com/clawvisor/clawvisor/pkg/store"
 	"github.com/google/uuid"
 )
 
@@ -53,7 +53,9 @@ func TestRuntimeHandlerCreatePlaceholder(t *testing.T) {
 
 	rec := httptest.NewRecorder()
 	h := NewRuntimeHandler(st, v, nil, nil, nil)
+	before := time.Now().UTC()
 	h.CreatePlaceholder(rec, req)
+	after := time.Now().UTC()
 
 	if rec.Code != http.StatusCreated {
 		t.Fatalf("CreatePlaceholder status=%d body=%s", rec.Code, rec.Body.String())
@@ -66,6 +68,9 @@ func TestRuntimeHandlerCreatePlaceholder(t *testing.T) {
 	if placeholder == "" {
 		t.Fatal("expected placeholder in response")
 	}
+	if resp["expires_at"] == "" {
+		t.Fatalf("expected expires_at in response: %+v", resp)
+	}
 	meta, err := st.GetRuntimePlaceholder(ctx, placeholder)
 	if err != nil {
 		t.Fatalf("GetRuntimePlaceholder: %v", err)
@@ -73,12 +78,181 @@ func TestRuntimeHandlerCreatePlaceholder(t *testing.T) {
 	if meta.AgentID != agent.ID || meta.UserID != user.ID || meta.ServiceID != "google.gmail:work" {
 		t.Fatalf("unexpected placeholder metadata: %+v", meta)
 	}
+	if meta.ExpiresAt == nil || meta.ExpiresAt.Before(before.Add(time.Hour-time.Second)) || meta.ExpiresAt.After(after.Add(time.Hour+time.Second)) {
+		t.Fatalf("unexpected placeholder expiration: %+v", meta.ExpiresAt)
+	}
+	auth, err := st.GetCredentialAuthorization(ctx, meta.CredentialGrantID)
+	if err != nil {
+		t.Fatalf("GetCredentialAuthorization: %v", err)
+	}
+	if auth.ExpiresAt == nil || auth.ExpiresAt.Sub(*meta.ExpiresAt) > time.Second || meta.ExpiresAt.Sub(*auth.ExpiresAt) > time.Second {
+		t.Fatalf("credential grant should share placeholder expiration, auth=%+v placeholder=%+v", auth, meta)
+	}
+}
+
+func TestRuntimeHandlerCreateUserPlaceholderFromVaultItem(t *testing.T) {
+	ctx := context.Background()
+	db, err := sqlite.New(ctx, filepath.Join(t.TempDir(), "runtime-user-placeholder.db"))
+	if err != nil {
+		t.Fatalf("sqlite.New: %v", err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	st := sqlite.NewStore(db)
+	v, err := intvault.NewLocalVault(filepath.Join(t.TempDir(), "vault.key"), db, "sqlite")
+	if err != nil {
+		t.Fatalf("NewLocalVault: %v", err)
+	}
+
+	user, err := st.CreateUser(ctx, "runtime-user-placeholder@test.example", "hash")
+	if err != nil {
+		t.Fatalf("CreateUser: %v", err)
+	}
+	if err := v.Set(ctx, user.ID, "anthropic", []byte(`sk-ant-test-key`)); err != nil {
+		t.Fatalf("vault.Set: %v", err)
+	}
+
+	body, _ := json.Marshal(map[string]any{
+		"service":     "llm:anthropic:user",
+		"ttl_seconds": 900,
+	})
+	req := httptest.NewRequest(http.MethodPost, "/api/runtime/placeholders/mint", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req = req.WithContext(context.WithValue(req.Context(), middleware.UserContextKey, user))
+
+	before := time.Now().UTC()
+	rec := httptest.NewRecorder()
+	h := NewRuntimeHandler(st, v, nil, nil, nil)
+	h.CreateUserPlaceholder(rec, req)
+	after := time.Now().UTC()
+
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("CreateUserPlaceholder status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	var entry store.RuntimePlaceholder
+	if err := json.Unmarshal(rec.Body.Bytes(), &entry); err != nil {
+		t.Fatalf("unmarshal response: %v", err)
+	}
+	if entry.Placeholder == "" {
+		t.Fatal("expected placeholder in response")
+	}
+	if entry.AgentID != "" {
+		t.Fatalf("manual placeholder should be user-wide when agent_id is omitted, got %q", entry.AgentID)
+	}
+	if entry.ServiceID != "llm:anthropic:user" || entry.VaultItemID != "llm:anthropic:user" {
+		t.Fatalf("placeholder should preserve requested vault item id, got %+v", entry)
+	}
+	if entry.CredentialGrantID == "" {
+		t.Fatalf("expected credential grant on manual placeholder: %+v", entry)
+	}
+	if entry.ExpiresAt == nil {
+		t.Fatalf("expected expiration on manual placeholder: %+v", entry)
+	}
+	if entry.ExpiresAt.Before(before.Add(899*time.Second)) || entry.ExpiresAt.After(after.Add(901*time.Second)) {
+		t.Fatalf("unexpected expiration %s", entry.ExpiresAt)
+	}
+	auth, err := st.GetCredentialAuthorization(ctx, entry.CredentialGrantID)
+	if err != nil {
+		t.Fatalf("GetCredentialAuthorization: %v", err)
+	}
+	if auth.AgentID != "" || auth.Scope != "manual" || auth.CredentialRef != "anthropic" || auth.Service != "llm:anthropic:user" {
+		t.Fatalf("unexpected credential grant: %+v", auth)
+	}
+	if auth.ExpiresAt == nil || auth.ExpiresAt.Sub(*entry.ExpiresAt) > time.Second || entry.ExpiresAt.Sub(*auth.ExpiresAt) > time.Second {
+		t.Fatalf("credential grant should share placeholder expiration, auth=%+v placeholder=%+v", auth, entry)
+	}
+
+	defaultTTLBody, _ := json.Marshal(map[string]any{"service": "llm:anthropic:user"})
+	defaultTTLReq := httptest.NewRequest(http.MethodPost, "/api/runtime/placeholders/mint", bytes.NewReader(defaultTTLBody))
+	defaultTTLReq.Header.Set("Content-Type", "application/json")
+	defaultTTLReq = defaultTTLReq.WithContext(context.WithValue(defaultTTLReq.Context(), middleware.UserContextKey, user))
+	defaultBefore := time.Now().UTC()
+	defaultRec := httptest.NewRecorder()
+	h.CreateUserPlaceholder(defaultRec, defaultTTLReq)
+	defaultAfter := time.Now().UTC()
+	if defaultRec.Code != http.StatusCreated {
+		t.Fatalf("CreateUserPlaceholder default TTL status=%d body=%s", defaultRec.Code, defaultRec.Body.String())
+	}
+	var defaultEntry store.RuntimePlaceholder
+	if err := json.Unmarshal(defaultRec.Body.Bytes(), &defaultEntry); err != nil {
+		t.Fatalf("unmarshal default TTL response: %v", err)
+	}
+	if defaultEntry.ExpiresAt == nil {
+		t.Fatalf("expected default expiration on manual placeholder: %+v", defaultEntry)
+	}
+	if defaultEntry.ExpiresAt.Before(defaultBefore.Add(time.Hour-time.Second)) || defaultEntry.ExpiresAt.After(defaultAfter.Add(time.Hour+time.Second)) {
+		t.Fatalf("unexpected default expiration %s", defaultEntry.ExpiresAt)
+	}
 }
 
 func TestRuntimeHandlerOneOffTTLDefaultsWhenConfigNil(t *testing.T) {
 	h := NewRuntimeHandler(nil, nil, nil, nil, nil)
 	if got := h.oneOffTTLSeconds(); got != 300 {
 		t.Fatalf("oneOffTTLSeconds()=%d, want 300", got)
+	}
+}
+
+func TestRuntimeHandlerStatusAndSessionsWithoutRuntimeManager(t *testing.T) {
+	ctx := context.Background()
+	db, err := sqlite.New(ctx, filepath.Join(t.TempDir(), "runtime-lite.db"))
+	if err != nil {
+		t.Fatalf("sqlite.New: %v", err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	st := sqlite.NewStore(db)
+
+	user, err := st.CreateUser(ctx, "runtime-lite@test.example", "hash")
+	if err != nil {
+		t.Fatalf("CreateUser: %v", err)
+	}
+	cfg := config.Default()
+	cfg.RuntimeProxy.Enabled = false
+	cfg.ProxyLite.Enabled = true
+
+	var runtimeMgr *runtimeproxy.Manager
+	h := NewRuntimeHandler(st, nil, runtimeMgr, cfg, nil)
+
+	statusReq := httptest.NewRequest(http.MethodGet, "/api/runtime/status", nil)
+	statusReq = statusReq.WithContext(context.WithValue(statusReq.Context(), middleware.UserContextKey, user))
+	statusRec := httptest.NewRecorder()
+	h.Status(statusRec, statusReq)
+	if statusRec.Code != http.StatusOK {
+		t.Fatalf("Status status=%d body=%s", statusRec.Code, statusRec.Body.String())
+	}
+	var statusResp struct {
+		Enabled          bool   `json:"enabled"`
+		ProxyLiteEnabled bool   `json:"proxy_lite_enabled"`
+		ProxyURL         string `json:"proxy_url"`
+		CACertPEM        string `json:"ca_cert_pem"`
+	}
+	if err := json.Unmarshal(statusRec.Body.Bytes(), &statusResp); err != nil {
+		t.Fatalf("unmarshal status: %v", err)
+	}
+	if statusResp.Enabled {
+		t.Fatalf("full runtime proxy should be disabled: %+v", statusResp)
+	}
+	if !statusResp.ProxyLiteEnabled {
+		t.Fatalf("proxy-lite should be reported enabled: %+v", statusResp)
+	}
+	if statusResp.ProxyURL != "" || statusResp.CACertPEM != "" {
+		t.Fatalf("nil manager should not report full-proxy connection data: %+v", statusResp)
+	}
+
+	sessionsReq := httptest.NewRequest(http.MethodGet, "/api/runtime/sessions", nil)
+	sessionsReq = sessionsReq.WithContext(context.WithValue(sessionsReq.Context(), middleware.UserContextKey, user))
+	sessionsRec := httptest.NewRecorder()
+	h.ListSessions(sessionsRec, sessionsReq)
+	if sessionsRec.Code != http.StatusOK {
+		t.Fatalf("ListSessions status=%d body=%s", sessionsRec.Code, sessionsRec.Body.String())
+	}
+	var sessionsResp struct {
+		Entries []store.RuntimeSession `json:"entries"`
+		Total   int                    `json:"total"`
+	}
+	if err := json.Unmarshal(sessionsRec.Body.Bytes(), &sessionsResp); err != nil {
+		t.Fatalf("unmarshal sessions: %v", err)
+	}
+	if sessionsResp.Total != 0 || len(sessionsResp.Entries) != 0 {
+		t.Fatalf("expected empty sessions without runtime manager: %+v", sessionsResp)
 	}
 }
 
@@ -263,6 +437,107 @@ func TestRuntimeHandlerListApprovalsExcludesRevokedAndExpiredSessions(t *testing
 	}
 	if expiredApproval.Status != "pending" || expiredApproval.Resolution != "" || expiredApproval.ResolvedAt != nil {
 		t.Fatalf("expected expired-session approval to remain unresolved when filtered from list: %+v", expiredApproval)
+	}
+}
+
+// Regression: task_create and task_expand approvals already surface in
+// the dedicated Tasks UI. Including them in the runtime-approvals
+// queue too produced a confusing "duplicate" badge (the same task
+// appearing as both a Task row AND a "runtime retry approval" item).
+// They must be filtered out of ListApprovals.
+func TestRuntimeHandlerListApprovalsExcludesTaskApprovals(t *testing.T) {
+	ctx := context.Background()
+	db, err := sqlite.New(ctx, filepath.Join(t.TempDir(), "runtime-approvals-task-filter.db"))
+	if err != nil {
+		t.Fatalf("sqlite.New: %v", err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	st := sqlite.NewStore(db)
+
+	user, err := st.CreateUser(ctx, "task-approvals-filter@test.example", "hash")
+	if err != nil {
+		t.Fatalf("CreateUser: %v", err)
+	}
+	agent, err := st.CreateAgent(ctx, user.ID, "task-filter-agent", "task-filter-hash")
+	if err != nil {
+		t.Fatalf("CreateAgent: %v", err)
+	}
+
+	task := &store.Task{
+		ID:      "task-1",
+		UserID:  user.ID,
+		AgentID: agent.ID,
+		Status:  "pending",
+		Purpose: "Filter test",
+	}
+	if err := st.CreateTask(ctx, task); err != nil {
+		t.Fatalf("CreateTask: %v", err)
+	}
+
+	taskApproval := &store.ApprovalRecord{
+		ID:                  "approval-task-create",
+		Kind:                "task_create",
+		UserID:              user.ID,
+		AgentID:             &agent.ID,
+		TaskID:              &task.ID,
+		Status:              "pending",
+		Surface:             "dashboard",
+		ResolutionTransport: "task_state_update",
+	}
+	if err := st.CreateApprovalRecord(ctx, taskApproval); err != nil {
+		t.Fatalf("CreateApprovalRecord(task_create): %v", err)
+	}
+
+	// A normal runtime approval that DOES belong in the list.
+	payload, _ := json.Marshal(runtimeproxy.RuntimeApprovalPayload{
+		AgentID:            agent.ID,
+		RequestFingerprint: "request-once-1",
+		Method:             "GET",
+		Host:               "example.com",
+		Path:               "/x",
+	})
+	requestApproval := &store.ApprovalRecord{
+		ID:                  "approval-request-once",
+		Kind:                "request_once",
+		UserID:              user.ID,
+		AgentID:             &agent.ID,
+		Status:              "pending",
+		Surface:             "dashboard",
+		PayloadJSON:         payload,
+		ResolutionTransport: "consume_one_off_retry",
+	}
+	if err := st.CreateApprovalRecord(ctx, requestApproval); err != nil {
+		t.Fatalf("CreateApprovalRecord(request_once): %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/api/runtime/approvals", nil)
+	req = req.WithContext(context.WithValue(req.Context(), middleware.UserContextKey, user))
+	rec := httptest.NewRecorder()
+	h := NewRuntimeHandler(st, nil, nil, nil, nil)
+	h.ListApprovals(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("ListApprovals status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	var resp struct {
+		Entries []store.ApprovalRecord `json:"entries"`
+		Total   int                    `json:"total"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("unmarshal response: %v", err)
+	}
+	if resp.Total != 1 || len(resp.Entries) != 1 || resp.Entries[0].ID != "approval-request-once" {
+		t.Fatalf("expected only the non-task approval to appear; got %+v", resp)
+	}
+
+	// The task approval must still exist in the store (resolution
+	// machinery looks it up by task_id later).
+	got, err := st.GetApprovalRecord(ctx, "approval-task-create")
+	if err != nil {
+		t.Fatalf("task approval should remain in store: %v", err)
+	}
+	if got.Status != "pending" {
+		t.Errorf("task approval status changed unexpectedly: %s", got.Status)
 	}
 }
 

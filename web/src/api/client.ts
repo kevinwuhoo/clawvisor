@@ -444,10 +444,36 @@ export interface ApprovalRecord {
 export interface RuntimePlaceholder {
   placeholder: string
   user_id: string
-  agent_id: string
+  agent_id?: string
   service_id: string
+  vault_item_id?: string
+  credential_grant_id?: string
+  task_id?: string
   created_at: string
+  expires_at?: string
+  revoked_at?: string
   last_used_at?: string
+  use_count?: number
+}
+
+export interface VaultServiceBinding {
+  service_id: string
+  alias?: string
+  name: string
+}
+
+export interface VaultItem {
+  id: string
+  name: string
+  kind: 'connected_account' | 'secret' | 'llm_provider_key'
+  provider?: string
+  scope?: 'user' | 'agent' | string
+  status: string
+  metadata?: Record<string, string>
+  service_bindings?: VaultServiceBinding[]
+  active_placeholder_count: number
+  last_used_at?: string
+  placeholders?: RuntimePlaceholder[]
 }
 
 export interface NotificationConfig {
@@ -527,8 +553,8 @@ export interface Task {
   status: 'pending_approval' | 'pending_scope_expansion' | 'active' | 'completed' | 'expired' | 'denied' | 'revoked'
   authorized_actions: TaskAction[]
   planned_calls?: PlannedCall[]
-  expected_tools_json?: ExpectedTool[]
-  expected_egress_json?: ExpectedEgress[]
+  expected_tools?: ExpectedTool[]
+  expected_egress?: ExpectedEgress[]
   intent_verification_mode?: 'strict' | 'lenient' | 'off'
   expected_use?: string
   schema_version?: number
@@ -581,6 +607,7 @@ export interface FeatureSet {
   local_daemon: boolean
   mobile_pairing: boolean
   runtime_proxy: boolean
+  proxy_lite: boolean
   secret_vault: boolean
   runtime_policy_ui: boolean
   runtime_activity: boolean
@@ -621,6 +648,8 @@ export interface ActivityBucket {
 
 export interface RuntimeStatus {
   enabled: boolean
+  proxy_lite_enabled?: boolean
+  passthrough?: RuntimePassthroughState
   proxy_url: string
   observation_mode_default: boolean
   inline_approval_enabled: boolean
@@ -630,6 +659,14 @@ export interface RuntimeStatus {
   inject_stored_bearer?: boolean
   ca_cert_pem: string
   starter_profiles?: StarterProfile[]
+}
+
+export interface RuntimePassthroughState {
+  enabled: boolean
+  rule_id?: string
+  agent_id?: string
+  expires_at?: string
+  reason?: string
 }
 
 export interface RuntimeSession {
@@ -670,7 +707,7 @@ export interface RuntimePolicyRule {
   id: string
   user_id: string
   agent_id?: string
-  kind: 'egress' | 'tool' | 'service'
+  kind: 'egress' | 'tool' | 'service' | 'passthrough' | 'secret_suppression' | 'secret_rewrite'
   action: 'allow' | 'deny' | 'review'
   service?: string
   service_action?: string
@@ -689,6 +726,24 @@ export interface RuntimePolicyRule {
   last_matched_at?: string
   created_at: string
   updated_at: string
+}
+
+export interface RuntimeToolControl {
+  agent_id: string
+  tool_name: string
+  // Agent-scoped UI "unset" is persisted by the backend as a review fallback
+  // rule so task scopes still govern the tool without an explicit allow/deny.
+  action: 'unset' | 'allow' | 'review' | 'deny'
+  rule_id?: string
+  source: 'default' | 'request' | 'observed' | 'rule'
+  scope?: 'unset' | 'global' | 'agent'
+  global_action: 'unset' | 'allow' | 'review' | 'deny'
+  global_rule_id?: string
+  agent_action: 'unset' | 'allow' | 'review' | 'deny'
+  agent_rule_id?: string
+  last_seen_at?: string
+  advanced_rule_count: number
+  advanced_rules?: RuntimePolicyRule[]
 }
 
 export interface RuntimeRuleCandidate {
@@ -1134,6 +1189,8 @@ export const api = {
       post<{ status: string; agent_id: string }>(`/api/agents/connect/${id}/approve`, {}),
     deny: (id: string) =>
       post<{ status: string }>(`/api/agents/connect/${id}/deny`, {}),
+    mintClaim: () =>
+      post<{ code: string; expires_at: string }>('/api/agents/connect/claim', {}),
   },
   services: {
     list: async () => {
@@ -1225,6 +1282,10 @@ export const api = {
   },
   runtime: {
     status: () => get<RuntimeStatus>('/api/runtime/status'),
+    enablePassthrough: (body: { agent_id?: string; ttl_seconds?: number; indefinite?: boolean; reason?: string; confirmation_text?: string }) =>
+      post<RuntimePassthroughState>('/api/runtime/passthrough', body),
+    disablePassthrough: (ruleId?: string) =>
+      del<{ status: string }>(ruleId ? `/api/runtime/passthrough/${encodeURIComponent(ruleId)}` : '/api/runtime/passthrough'),
     listApprovals: () => get<{ entries: ApprovalRecord[]; total: number }>('/api/runtime/approvals'),
     resolveApproval: (approvalId: string, resolution: 'allow_once' | 'allow_session' | 'allow_always' | 'deny') =>
       post<{ approval_id: string; status: string; resolution: string; task_id?: string }>(
@@ -1244,6 +1305,10 @@ export const api = {
         agent_id: params?.agent_id,
         enabled: params?.enabled === undefined ? undefined : (params.enabled ? 'true' : 'false'),
       }),
+    listToolControls: (agentId: string) =>
+      get<{ entries: RuntimeToolControl[]; total: number }>('/api/runtime/tool-controls', { agent_id: agentId }),
+    updateToolControl: (control: { agent_id: string; tool_name: string; action: 'unset' | 'allow' | 'deny'; scope?: 'global' | 'agent' }) =>
+      put<RuntimeToolControl>('/api/runtime/tool-controls', control),
     createRule: (rule: Partial<RuntimePolicyRule> & { scope?: 'agent' | 'global' }) =>
       post<RuntimePolicyRule>('/api/runtime/rules', rule),
     updateRule: (id: string, rule: Partial<RuntimePolicyRule> & { scope?: 'agent' | 'global' }) =>
@@ -1253,8 +1318,8 @@ export const api = {
     applyStarterProfile: (profileId: string, agentId?: string) =>
       post<{ entries: RuntimePolicyRule[]; total: number }>(`/api/runtime/starter-profiles/${profileId}/apply`, agentId ? { agent_id: agentId } : {}),
     listPlaceholders: () => get<{ entries: RuntimePlaceholder[]; total: number }>('/api/runtime/placeholders'),
-    mintPlaceholder: (agentId: string, service: string) =>
-      post<RuntimePlaceholder>('/api/runtime/placeholders/mint', { agent_id: agentId, service }),
+    mintPlaceholder: (agentId: string | undefined, service: string, ttlSeconds?: number) =>
+      post<RuntimePlaceholder>('/api/runtime/placeholders/mint', { agent_id: agentId, service, ttl_seconds: ttlSeconds }),
     deletePlaceholder: (placeholder: string) =>
       del<{ placeholder: string; status: string }>(`/api/runtime/placeholders/${encodeURIComponent(placeholder)}`),
     getPresetDecision: (commandKey: string, profile: string) =>
@@ -1265,6 +1330,17 @@ export const api = {
       get<RuntimeRuleCandidate>(`/api/runtime/events/${eventId}/rule-candidate`, { action }),
     promoteEventToTask: (eventId: string, lifetime: 'session' | 'standing') =>
       post<{ task_id: string }>(`/api/runtime/events/${eventId}/promote-task`, { lifetime }),
+  },
+  vault: {
+    listItems: () => get<{ entries: VaultItem[]; total: number }>('/api/vault/items'),
+    createItem: (id: string, value: string) =>
+      post<{ id: string; status: string }>('/api/vault/items', { id, value }),
+    getItem: (id: string) => get<VaultItem>(`/api/vault/items/${encodeURIComponent(id)}`),
+    updateItem: (id: string, value: string) =>
+      put<{ id: string; status: string }>(`/api/vault/items/${encodeURIComponent(id)}`, { value }),
+    deleteItem: (id: string) =>
+      del<{ id: string; status: string }>(`/api/vault/items/${encodeURIComponent(id)}`),
+    listAgentItems: () => get<{ entries: VaultItem[]; total: number }>('/api/agent/vault/items'),
   },
   notifications: {
     list: () => get<NotificationConfig[]>('/api/notifications'),
@@ -1314,6 +1390,30 @@ export const api = {
     status: () => get<LLMStatus>('/api/llm/status'),
     update: (provider: string, endpoint: string, apiKey: string, model: string) =>
       put<{ status: string; warning?: string }>('/api/llm', { provider, endpoint, api_key: apiKey, model }),
+  },
+  // Lite-proxy upstream LLM credentials (separate from /api/llm which is
+  // the daemon's own intent verifier key). These keys are what the
+  // lite-proxy swaps in when forwarding /v1/messages and /v1/chat/completions
+  // to api.anthropic.com / api.openai.com. agent_id scopes the credential
+  // to a specific agent — when omitted, it's stored at the user level.
+  llmCredentials: {
+    list: (agentId?: string) =>
+      get<{ credentials: { provider: string; stored: boolean; agent_stored?: boolean; agent_id?: string }[] }>(
+        agentId ? `/api/runtime/llm-credentials?agent_id=${encodeURIComponent(agentId)}` : '/api/runtime/llm-credentials',
+      ),
+    set: (provider: string, apiKey: string, agentId?: string) =>
+      put<{ provider: string; service_id: string; status: string; agent_id?: string }>(
+        agentId
+          ? `/api/runtime/llm-credentials/${provider}?agent_id=${encodeURIComponent(agentId)}`
+          : `/api/runtime/llm-credentials/${provider}`,
+        { api_key: apiKey },
+      ),
+    delete: (provider: string, agentId?: string) =>
+      del<void>(
+        agentId
+          ? `/api/runtime/llm-credentials/${provider}?agent_id=${encodeURIComponent(agentId)}`
+          : `/api/runtime/llm-credentials/${provider}`,
+      ),
   },
   system: {
     getGoogleOAuth: () =>

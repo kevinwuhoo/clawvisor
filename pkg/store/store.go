@@ -46,6 +46,7 @@ type Store interface {
 	// (equivalent to CreateAgent).
 	CreateAgentWithExpiry(ctx context.Context, userID, name, tokenHash string, expiresAt time.Time) (*Agent, error)
 	GetAgentByToken(ctx context.Context, tokenHash string) (*Agent, error)
+	GetAgent(ctx context.Context, agentID string) (*Agent, error)
 	ListAgents(ctx context.Context, userID string) ([]*Agent, error)
 	UpdateAgentDescription(ctx context.Context, agentID, userID, description string) error
 	GetAgentRuntimeSettings(ctx context.Context, agentID string) (*AgentRuntimeSettings, error)
@@ -276,6 +277,7 @@ type Store interface {
 	CreateCredentialAuthorization(ctx context.Context, auth *CredentialAuthorization) error
 	GetCredentialAuthorization(ctx context.Context, id string) (*CredentialAuthorization, error)
 	ConsumeMatchingCredentialAuthorization(ctx context.Context, match CredentialAuthorizationMatch, now time.Time) (*CredentialAuthorization, error)
+	DeleteCredentialAuthorization(ctx context.Context, id, userID string) error
 
 	// Runtime one-off approvals
 	CreateOneOffApproval(ctx context.Context, approval *OneOffApproval) error
@@ -323,6 +325,13 @@ type Store interface {
 	GetConnectionRequest(ctx context.Context, id string) (*ConnectionRequest, error)
 	ListPendingConnectionRequests(ctx context.Context, userID string) ([]*ConnectionRequest, error)
 	UpdateConnectionRequestStatus(ctx context.Context, id, status, agentID string) error
+	// UpdateConnectionRequestStatusIfPending transitions the row only if
+	// its current status is "pending". Returns true when the row was
+	// modified, false when another writer beat us (status was already
+	// approved/denied/expired). Lets timeout-style callers expire a
+	// pending request without clobbering an approval that landed in the
+	// race window.
+	UpdateConnectionRequestStatusIfPending(ctx context.Context, id, status string) (modified bool, err error)
 	DeleteExpiredConnectionRequests(ctx context.Context) error
 	CountPendingConnectionRequestsForUser(ctx context.Context, userID string) (int, error)
 
@@ -570,8 +579,9 @@ type Task struct {
 	Lifetime               string          `json:"lifetime"` // session | standing
 	AuthorizedActions      []TaskAction    `json:"authorized_actions"`
 	PlannedCalls           []PlannedCall   `json:"planned_calls,omitempty"`
-	ExpectedTools          json.RawMessage `json:"expected_tools_json,omitempty"`
-	ExpectedEgress         json.RawMessage `json:"expected_egress_json,omitempty"`
+	ExpectedTools          json.RawMessage `json:"expected_tools,omitempty"`
+	ExpectedEgress         json.RawMessage `json:"expected_egress,omitempty"`
+	RequiredCredentials    json.RawMessage `json:"required_credentials,omitempty"`
 	IntentVerificationMode string          `json:"intent_verification_mode,omitempty"`
 	// ChainExtractionMode overrides the system default for async chain-context
 	// extraction. "" (unset) defers to the system default; "full" runs the
@@ -672,13 +682,19 @@ type RuntimeEvent struct {
 }
 
 type RuntimePolicyRule struct {
-	ID            string          `json:"id"`
-	UserID        string          `json:"user_id"`
-	AgentID       *string         `json:"agent_id,omitempty"`
-	Kind          string          `json:"kind"`
-	Action        string          `json:"action"`
-	Service       string          `json:"service,omitempty"`
-	ServiceAction string          `json:"service_action,omitempty"`
+	ID            string  `json:"id"`
+	UserID        string  `json:"user_id"`
+	AgentID       *string `json:"agent_id,omitempty"`
+	Kind          string  `json:"kind"`
+	Action        string  `json:"action"`
+	Service       string  `json:"service,omitempty"`
+	ServiceAction string  `json:"service_action,omitempty"`
+	// Host and Path are kind-specific match/storage fields. For egress
+	// rules they are request matchers; secret_suppression uses Host for
+	// the secret fingerprint; secret_rewrite uses Host for the fingerprint
+	// and Path for the runtime placeholder; passthrough uses Path for the
+	// RFC3339 expiry. Keep new machine-owned rule kinds documented here
+	// until they have dedicated metadata storage.
 	Host          string          `json:"host,omitempty"`
 	Method        string          `json:"method,omitempty"`
 	Path          string          `json:"path,omitempty"`
@@ -716,12 +732,18 @@ type RuntimePresetDecision struct {
 // RuntimePlaceholder is an agent-scoped placeholder that resolves to an
 // existing vault credential at proxy runtime.
 type RuntimePlaceholder struct {
-	Placeholder string     `json:"placeholder"`
-	UserID      string     `json:"user_id"`
-	AgentID     string     `json:"agent_id"`
-	ServiceID   string     `json:"service_id"`
-	CreatedAt   time.Time  `json:"created_at"`
-	LastUsedAt  *time.Time `json:"last_used_at,omitempty"`
+	Placeholder       string     `json:"placeholder"`
+	UserID            string     `json:"user_id"`
+	AgentID           string     `json:"agent_id,omitempty"`
+	ServiceID         string     `json:"service_id"`
+	VaultItemID       string     `json:"vault_item_id,omitempty"`
+	CredentialGrantID string     `json:"credential_grant_id,omitempty"`
+	TaskID            string     `json:"task_id,omitempty"`
+	CreatedAt         time.Time  `json:"created_at"`
+	ExpiresAt         *time.Time `json:"expires_at,omitempty"`
+	RevokedAt         *time.Time `json:"revoked_at,omitempty"`
+	LastUsedAt        *time.Time `json:"last_used_at,omitempty"`
+	UseCount          int        `json:"use_count,omitempty"`
 }
 
 // CredentialAuthorization grants reuse of a previously reviewed outbound
