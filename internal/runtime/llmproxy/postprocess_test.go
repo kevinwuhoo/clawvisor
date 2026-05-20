@@ -12,6 +12,7 @@ import (
 	"github.com/clawvisor/clawvisor/internal/runtime/conversation"
 	"github.com/clawvisor/clawvisor/internal/runtime/llmproxy/inspector"
 	runtimedecision "github.com/clawvisor/clawvisor/pkg/runtime/decision"
+	"github.com/clawvisor/clawvisor/pkg/runtime/toolnames"
 	"github.com/clawvisor/clawvisor/pkg/store"
 	"github.com/clawvisor/clawvisor/pkg/store/sqlite"
 )
@@ -202,7 +203,7 @@ func TestBoundaryCheckVerdictUnknownServiceFailsClosed(t *testing.T) {
 	}
 }
 
-func TestPostprocess_ReadOnlyBashRequiresPolicyOrTaskScope(t *testing.T) {
+func TestPostprocess_ReadOnlyBashBypassesTaskScopeByDefault(t *testing.T) {
 	cases := []struct {
 		name string
 		cmd  string
@@ -238,10 +239,55 @@ func TestPostprocess_ReadOnlyBashRequiresPolicyOrTaskScope(t *testing.T) {
 				Posture:          runtimedecision.PostureEnforce,
 			})
 
-			if !got.Rewritten {
-				t.Fatalf("read-only bash %q should require a policy rule or task scope", tc.cmd)
+			if got.Rewritten {
+				t.Fatalf("read-only bash %q should pass through; got rewrite body=%s", tc.cmd, got.Body)
+			}
+			rows, _, err := st.ListAuditEntries(req.Context(), userID, store.AuditFilter{})
+			if err != nil {
+				t.Fatalf("ListAuditEntries: %v", err)
+			}
+			if len(rows) != 1 || rows[0].Outcome != "readonly_shell_pass_through" {
+				t.Fatalf("expected readonly_shell_pass_through, got %d rows outcome=%q", len(rows), rows[0].Outcome)
 			}
 		})
+	}
+}
+
+func TestPostprocess_ReadOnlyBashCanBeDisabledByPolicy(t *testing.T) {
+	body := anthropicJSONWithNamedToolUse("Bash", `{"command":"ls -la /tmp"}`)
+	req := httptest.NewRequest("POST", "/v1/messages", nil)
+	insp := inspector.NewInspector(inspector.DefaultParser{}, inspector.AmbiguousValidator{})
+	st, userID, agentID := seedPostprocessStore(t, "autovault_github_xxx")
+	agentRuleID := "readonly-shell-disabled"
+
+	got := Postprocess(req, body, "application/json", PostprocessConfig{
+		Inspector:      insp,
+		RewriteOpts:    inspector.DefaultRewriteOpts("https://proxy.example/api/proxy"),
+		CallerNonces:   NewMemoryCallerNonceCache(time.Minute),
+		Store:          st,
+		AgentUserID:    userID,
+		AgentID:        agentID,
+		Audit:          NewAuditEmitter(st, nil, nil),
+		RequestID:      "req-bash-readonly-disabled",
+		CandidateTasks: []*store.Task{},
+		ToolRules: []*store.RuntimePolicyRule{{
+			ID:         agentRuleID,
+			UserID:     userID,
+			AgentID:    &agentID,
+			Kind:       "tool",
+			Action:     "deny",
+			ToolName:   "Bash",
+			InputShape: toolnames.ReadOnlyShellSettingInputShape(),
+			Source:     toolnames.ReadOnlyShellSettingSource,
+			Enabled:    true,
+		}},
+		EgressRules:      []*store.RuntimePolicyRule{},
+		PendingApprovals: NewMemoryPendingApprovalCache(time.Minute),
+		Posture:          runtimedecision.PostureEnforce,
+	})
+
+	if !got.Rewritten {
+		t.Fatalf("read-only bash should require approval when disabled")
 	}
 }
 

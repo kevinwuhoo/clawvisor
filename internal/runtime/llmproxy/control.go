@@ -9,6 +9,7 @@ import (
 
 	"github.com/clawvisor/clawvisor/internal/runtime/conversation"
 	"github.com/clawvisor/clawvisor/internal/runtime/llmproxy/inspector"
+	"github.com/clawvisor/clawvisor/pkg/runtime/toolnames"
 	"github.com/clawvisor/clawvisor/pkg/store"
 	"mvdan.cc/sh/v3/syntax"
 )
@@ -53,7 +54,9 @@ func controlNotice(controlBaseURL string, availableTools []string, toolRules []*
 		"",
 		"WORKFLOW — start every non-trivial request with a task.",
 		"",
-		"Create a task before multi-step work, writing files, making network calls, changing state, or using credentials. Don't wait for a tool call to be refused before creating a task.",
+		"Exception: do not create a task when the request can be completed using only tools or command shapes listed under ALLOWED WITHOUT A TASK below.",
+		"",
+		"Create a task before multi-step work, writing files, making network calls, changing state, or using credentials, unless every required tool call is allowed without a task. Don't wait for a tool call to be refused before creating a task.",
 		"",
 		"Task endpoint:",
 		"  - Interactive user present: POST " + tasksURLInline,
@@ -159,16 +162,50 @@ func controlWorkedExampleLines(tasksURLInline, shellTool string, availableTools 
 func controlAllowedWithoutTaskLines(availableTools []string, toolRules []*store.RuntimePolicyRule) []string {
 	tools := compactToolNames(availableTools)
 	policyAllowed := policyAllowedToolNames(tools, toolRules)
+	readOnlyShellTool := controlReadOnlyShellTool(tools, toolRules)
 	lines := []string{
 		"ALLOWED WITHOUT A TASK — for single-step, non-destructive inspection:",
 	}
 	if len(policyAllowed) > 0 {
 		lines = append(lines, "  - Active policy allowlists "+formatToolList(policyAllowed)+".")
 	}
+	if readOnlyShellTool != "" {
+		lines = append(lines, "  - Read-only commands through `"+readOnlyShellTool+"` may run without a task when they only inspect local state, such as `ls`, `cat`, `grep`, `rg`, `find`, `wc`, and `pwd`; mutating shell commands still need a task.")
+	}
 	if len(lines) == 1 {
 		lines = append(lines, "  - None yet. Use the dashboard Tool Controls to always allow specific tools.")
 	}
 	return lines
+}
+
+func controlReadOnlyShellTool(availableTools []string, toolRules []*store.RuntimePolicyRule) string {
+	shellTool := controlShellTool(availableTools)
+	if shellTool == "" {
+		return ""
+	}
+	allowed := true
+	var globalAllowed, agentAllowed *bool
+	for _, rule := range toolRules {
+		if rule == nil || !rule.Enabled || !toolnames.IsReadOnlyShellSettingRule(rule) || !toolnames.ToolNamesSameClass(rule.ToolName, shellTool) {
+			continue
+		}
+		ruleAllowed := strings.EqualFold(strings.TrimSpace(rule.Action), "allow")
+		if rule.AgentID == nil {
+			globalAllowed = &ruleAllowed
+		} else {
+			agentAllowed = &ruleAllowed
+		}
+	}
+	if globalAllowed != nil {
+		allowed = *globalAllowed
+	}
+	if agentAllowed != nil {
+		allowed = *agentAllowed
+	}
+	if !allowed {
+		return ""
+	}
+	return shellTool
 }
 
 func policyAllowedToolNames(availableTools []string, toolRules []*store.RuntimePolicyRule) []string {
@@ -183,6 +220,9 @@ func policyAllowedToolNames(availableTools []string, toolRules []*store.RuntimeP
 	var out []string
 	for _, rule := range toolRules {
 		if rule == nil || !rule.Enabled || rule.Kind != "tool" || rule.Action != "allow" {
+			continue
+		}
+		if toolnames.IsReadOnlyShellSettingRule(rule) {
 			continue
 		}
 		if name := strings.TrimSpace(rule.ToolName); name != "" {
@@ -221,8 +261,7 @@ func controlToolExamples(availableTools []string) string {
 
 func controlShellTool(availableTools []string) string {
 	for _, tool := range compactToolNames(availableTools) {
-		switch strings.ToLower(tool) {
-		case "bash", "shell", "exec", "exec_command", "terminal":
+		if toolnames.IsShellToolName(tool) {
 			return tool
 		}
 	}
@@ -247,7 +286,7 @@ func controlToolByAlias(availableTools []string, names ...string) string {
 
 func prioritizeControlToolExamples(tools []string) []string {
 	priority := []string{
-		"bash", "terminal", "shell", "exec", "exec_command",
+		"bash", "terminal", "shell", "exec", "exec_command", "mcp__shell__exec",
 		"write", "write_file", "edit", "patch",
 		"read", "read_file",
 		"process", "execute_code",

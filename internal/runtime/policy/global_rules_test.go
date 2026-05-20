@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"testing"
 
+	"github.com/clawvisor/clawvisor/pkg/runtime/toolnames"
 	"github.com/clawvisor/clawvisor/pkg/store"
 )
 
@@ -54,5 +55,26 @@ func TestMatchRuntimePolicyToolTreatsSystemDefaultsAsFallback(t *testing.T) {
 	}
 	if got == nil || got.ID != "agent-user-allow" {
 		t.Fatalf("agent-scoped user allow should outrank global user deny, got %+v", got)
+	}
+}
+
+func TestMatchRuntimePolicyToolIgnoresReadOnlyShellSettingMarker(t *testing.T) {
+	agentID := "agent-1"
+	rules := []*store.RuntimePolicyRule{{
+		ID:         "readonly-shell-marker",
+		AgentID:    &agentID,
+		Kind:       "tool",
+		Action:     "allow",
+		ToolName:   "Bash",
+		InputShape: toolnames.ReadOnlyShellSettingInputShape(),
+		Source:     toolnames.ReadOnlyShellSettingSource,
+		Enabled:    true,
+	}}
+	got, err := MatchRuntimePolicyTool(rules, agentID, "Bash", map[string]any{toolnames.ReadOnlyShellSettingShapeKey: true})
+	if err != nil {
+		t.Fatalf("MatchRuntimePolicyTool: %v", err)
+	}
+	if got != nil {
+		t.Fatalf("read-only shell marker must not act as a normal tool allow rule, got %+v", got)
 	}
 }
