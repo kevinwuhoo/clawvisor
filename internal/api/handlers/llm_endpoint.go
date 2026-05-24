@@ -816,6 +816,18 @@ func (h *LLMEndpointHandler) serve(w http.ResponseWriter, r *http.Request) {
 			"egress_rules", len(egressRules),
 			"preferred_task_id", preferredTaskID,
 		)
+		// Conversation-based auto-approval inputs: human turns from the
+		// inbound transcript and the agent's per-runtime threshold.
+		// Both are best-effort — extraction yields []string{} on a
+		// malformed body, and an unset threshold collapses to "off",
+		// which makes the gate refuse to fire. Either fallback
+		// preserves existing behavior (human approval prompt) rather
+		// than risking a spurious auto-approve.
+		recentTurns := llmproxy.ExtractRecentHumanTurns(llmproxy.ExtractHumanTurnsRequest{
+			Provider: provider,
+			Body:     body,
+		})
+		autoApproveThreshold := agentConversationAutoApproveThreshold(agent)
 		processed := llmproxy.Postprocess(r, full, upstreamCT, llmproxy.PostprocessConfig{
 			Inspector:        h.Inspector,
 			RewriteOpts:      opts,
@@ -838,10 +850,14 @@ func (h *LLMEndpointHandler) serve(w http.ResponseWriter, r *http.Request) {
 			// Per-tool-use nonce minting overrides RewriteOpts.CallerToken
 			// inside the credentialed rewrite path so the agent's raw
 			// bearer token never enters the model's conversation context.
-			CallerNonces:     h.CallerNonces,
-			Trace:            h.TraceLogger,
-			TaskRiskAssessor: h.taskRiskBridge(),
-			AgentName:        agent.Name,
+			CallerNonces:                     h.CallerNonces,
+			Trace:                            h.TraceLogger,
+			TaskRiskAssessor:                 h.taskRiskBridge(),
+			AgentName:                        agent.Name,
+			RecentUserTurns:                  recentTurns,
+			ConversationAutoApproveThreshold: autoApproveThreshold,
+			InlineTaskCreator:                h.InlineTaskCreator,
+			Checkouts:                        h.TaskCheckouts,
 		})
 		h.Logger.DebugContext(r.Context(), "lite-proxy postprocess complete",
 			"request_id", requestID,
@@ -852,6 +868,86 @@ func (h *LLMEndpointHandler) serve(w http.ResponseWriter, r *http.Request) {
 			"decisions", len(processed.Decisions),
 			"skipped_reason", processed.SkippedReason,
 		)
+
+		// Conversation continuation. When one or more tool_use verdicts
+		// asked the proxy to feed a synthetic tool_result back to the
+		// upstream (instead of bouncing to the user as an assistant text
+		// turn), build a continuation request, forward upstream, and run
+		// postprocess again on the new response. The harness then sees
+		// the model's next tool_use rather than a "task was approved"
+		// terminal message — letting auto-approved tasks proceed
+		// seamlessly. Recursion is bounded by construction: tryContinuation
+		// performs exactly one inline Postprocess pass and does not loop,
+		// so even if the second pass fires the auto-approve gate again it
+		// falls through to SubstituteWith (no further forward, no further
+		// Postprocess). On any failure path the handler falls back to the
+		// original `processed` (which still carries SubstituteWith as a
+		// terminal assistant text), so the harness never sees an empty body.
+		{
+			contFinal, contStatus, contCT, contErr := h.tryContinuation(r, agent, provider, requestID, body, full, upstreamCT, resp.StatusCode, processed, llmproxy.PostprocessConfig{
+				Inspector:                        h.Inspector,
+				RewriteOpts:                      opts,
+				Store:                            h.Store,
+				AgentUserID:                      agent.UserID,
+				AgentID:                          agent.ID,
+				ConversationID:                   conversationID,
+				Audit:                            h.AuditEmitter,
+				RequestID:                        requestID,
+				Catalog:                          catalogIface,
+				TaskScope:                        h.TaskScope,
+				IntentVerifier:                   h.IntentVerifier,
+				Posture:                          liteProxyDecisionPosture(agent),
+				CandidateTasks:                   candidateTasks,
+				ToolRules:                        toolRules,
+				EgressRules:                      egressRules,
+				PreferredTaskID:                  preferredTaskID,
+				PendingApprovals:                 h.PendingApprovals,
+				ControlBaseURL:                   h.ControlBaseURL,
+				CallerNonces:                     h.CallerNonces,
+				Trace:                            h.TraceLogger,
+				TaskRiskAssessor:                 h.taskRiskBridge(),
+				AgentName:                        agent.Name,
+				RecentUserTurns:                  recentTurns,
+				ConversationAutoApproveThreshold: autoApproveThreshold,
+				InlineTaskCreator:                h.InlineTaskCreator,
+				Checkouts:                        h.TaskCheckouts,
+			})
+			switch {
+			case contErr != nil:
+				h.Logger.WarnContext(r.Context(), "lite-proxy continuation failed; falling back to substitute response",
+					"request_id", requestID, "agent_id", agent.ID, "err", contErr.Error())
+			case contFinal != nil:
+				// Treat any SkippedReason on the continuation's
+				// postprocess as a continuation failure regardless of
+				// whether a (possibly partial) body came back.
+				// SkippedReason indicates the rewriter couldn't finish
+				// its pass cleanly; swapping that body in would mask
+				// the original processed.SubstituteWith fallback and
+				// could leak partially-rewritten content (e.g. a
+				// literal autovault_… placeholder that never got
+				// resolved). Fall back to the original `processed`,
+				// matching the pre-continuation fail-closed posture.
+				if contFinal.SkippedReason != "" {
+					h.Logger.WarnContext(r.Context(), "lite-proxy continuation postprocess reported SkippedReason; falling back to substitute response",
+						"request_id", requestID,
+						"agent_id", agent.ID,
+						"skipped_reason", contFinal.SkippedReason,
+						"body_bytes", len(contFinal.Body),
+					)
+					break
+				}
+				processed = *contFinal
+				if contStatus != 0 {
+					resp.StatusCode = contStatus
+					auditStatus = contStatus
+					auditOutcome = outcomeFromStatus(contStatus)
+				}
+				if contCT != "" && contCT != upstreamCT {
+					w.Header().Set("Content-Type", contCT)
+				}
+			}
+		}
+
 		// Fail closed when postprocess could not finish its rewrite pass.
 		// A rewriter mid-body error leaves Body=nil with a non-empty
 		// SkippedReason; passing the upstream body through unchanged
@@ -968,6 +1064,258 @@ func readLimited(r io.Reader, max int64) ([]byte, error) {
 		return nil, errors.New("request body too large")
 	}
 	return buf, nil
+}
+
+// tryContinuation inspects the just-completed postprocess result for
+// tool_use verdicts that requested the proxy "continue the
+// conversation" (i.e. auto-approved tasks). When any are present and
+// the provider supports continuation, the handler builds a new
+// request body that appends the upstream's assistant turn plus a
+// synthetic user turn of tool_result blocks, forwards it upstream,
+// and re-runs postprocess on the new response. The new processed
+// result (along with its upstream status + content-type) is returned;
+// the caller swaps it in for the original.
+//
+// Returns (nil, 0, "", nil) when no continuation was requested — the
+// caller falls through to the existing path unchanged.
+// Returns an error when continuation was requested but couldn't be
+// completed (unsupported provider, malformed bodies, upstream failure);
+// the caller logs and falls back to the original processed result,
+// whose SubstituteWith fallback still surfaces the augmentation text
+// to the harness as a terminal assistant turn.
+func (h *LLMEndpointHandler) tryContinuation(
+	r *http.Request,
+	agent *store.Agent,
+	provider conversation.Provider,
+	requestID string,
+	inboundBody []byte,
+	upstreamBody []byte,
+	upstreamCT string,
+	upstreamStatus int,
+	processed llmproxy.PostprocessResult,
+	cfg llmproxy.PostprocessConfig,
+) (*llmproxy.PostprocessResult, int, string, error) {
+	if upstreamStatus >= 400 {
+		// Don't try to continue on top of an upstream error response —
+		// the model never actually emitted a clean tool_use turn, and
+		// the body shape may not match what extractAnthropicAssistantContent
+		// expects.
+		return nil, 0, "", nil
+	}
+	var toolResults []llmproxy.ContinuationToolResult
+	for _, dec := range processed.Decisions {
+		if dec.Verdict.ContinueWithToolResult == "" {
+			continue
+		}
+		toolResults = append(toolResults, llmproxy.ContinuationToolResult{
+			ToolUseID: dec.ToolUse.ID,
+			Content:   dec.Verdict.ContinueWithToolResult,
+		})
+	}
+	if len(toolResults) == 0 {
+		return nil, 0, "", nil
+	}
+	// Tool_use / tool_result must be 1:1 for the upstream — Anthropic
+	// and OpenAI Chat both 400 on an unbalanced continuation body. If
+	// the assistant turn carried sibling tool_uses that were NOT
+	// auto-approved (e.g. a Bash command we passed through alongside
+	// the POST /api/control/tasks the gate intercepted), we'd
+	// otherwise emit N tool_uses + len(toolResults) tool_results and
+	// the upstream would reject the turn. Worse, the proxy's response
+	// to the harness is the continuation: if we tried to continue
+	// anyway and the model ran something, the harness would also
+	// execute the passed-through Bash, double-running it. The safe
+	// answer is to skip continuation entirely and fall back to the
+	// substitute path — the user gets the [Clawvisor] bracketed
+	// fallback turn, the model sees no continuation, and the
+	// passed-through tool_use returns to its normal harness fate on
+	// the model's next turn.
+	if len(toolResults) != len(processed.Decisions) {
+		// The auto-approved task has already been created by the
+		// gate. The sibling tool_uses get dropped from the
+		// substitute-rendered assistant turn (the rewriter's "any
+		// blocked" branch substitutes the whole turn), so the
+		// harness never sees them — that's the surprising part for
+		// operators chasing "I approved the task but Bash never ran
+		// after that." Record a dedicated audit row enumerating the
+		// dropped tool names so the trail is greppable.
+		var droppedNames []string
+		var autoApprovedTUID, autoApprovedTaskID string
+		for _, dec := range processed.Decisions {
+			if dec.Verdict.ContinueWithToolResult != "" {
+				autoApprovedTUID = dec.ToolUse.ID
+				if autoApprovedTaskID == "" {
+					autoApprovedTaskID = dec.Verdict.CreatedTaskID
+				}
+				continue
+			}
+			droppedNames = append(droppedNames, dec.ToolUse.Name)
+		}
+		h.Logger.WarnContext(r.Context(), "lite-proxy continuation skipped: sibling tool_uses in same turn would unbalance tool_use/tool_result count",
+			"request_id", requestID,
+			"agent_id", agent.ID,
+			"task_id", autoApprovedTaskID,
+			"tool_uses_in_turn", len(processed.Decisions),
+			"continue_results", len(toolResults),
+			"dropped_tools", droppedNames,
+		)
+		if h.AuditEmitter != nil {
+			h.AuditEmitter.LogContinuationSkippedSiblingTools(r.Context(), agent, requestID, autoApprovedTaskID, autoApprovedTUID, droppedNames)
+		}
+		return nil, 0, "", nil
+	}
+	contBody, err := llmproxy.BuildContinuationBody(provider, upstreamCT, inboundBody, upstreamBody, toolResults)
+	if err != nil {
+		return nil, 0, "", fmt.Errorf("build continuation body: %w", err)
+	}
+	h.Logger.DebugContext(r.Context(), "lite-proxy continuation forwarding",
+		"request_id", requestID,
+		"agent_id", agent.ID,
+		"provider", string(provider),
+		"tool_results", len(toolResults),
+		"body_bytes", len(contBody),
+	)
+	resp, err := h.Forwarder.Forward(r.Context(), agent.UserID, agent.ID, provider, r, contBody)
+	if err != nil {
+		return nil, 0, "", fmt.Errorf("forward continuation: %w", err)
+	}
+	defer resp.Body.Close()
+	full, readErr := readResponseLimited(resp.Body, h.MaxResponseBytes)
+	if readErr != nil {
+		return nil, 0, "", fmt.Errorf("read continuation upstream: %w", readErr)
+	}
+	if resp.StatusCode >= 400 {
+		return nil, 0, "", fmt.Errorf("continuation upstream returned %d", resp.StatusCode)
+	}
+	contCT := resp.Header.Get("Content-Type")
+	if contCT == "" {
+		contCT = upstreamCT
+	}
+	// Refresh decision inputs before the continuation postprocess. The
+	// original cfg.CandidateTasks was loaded at the top of serve(),
+	// BEFORE the auto-approve gate created the new task — so it doesn't
+	// include the task we just minted. Without this reload the model's
+	// next tool_uses (Write, Bash, …) fall through to "no matching task
+	// scope" and the harness shows the human-approval prompt again,
+	// defeating the whole point of conversation auto-approval. ToolRules
+	// and EgressRules rarely change inside a single inbound request, but
+	// reloading them keeps the cfg internally consistent and absorbs any
+	// concurrent rule updates for free. PreferredTaskID gets recomputed
+	// from the checkouts cache (which the auto-approve path Set'd to the
+	// new task) so the decision layer's task preference matches the
+	// active checkout.
+	refreshedCandidates, refreshedToolRules, refreshedEgressRules, refreshErr := h.loadLiteProxyDecisionInputs(r.Context(), agent)
+	if refreshErr == nil {
+		cfg.CandidateTasks = refreshedCandidates
+		cfg.ToolRules = refreshedToolRules
+		cfg.EgressRules = refreshedEgressRules
+		if newPref, prefErr := h.checkedOutTaskID(r.Context(), agent, cfg.ConversationID, refreshedCandidates); prefErr == nil {
+			cfg.PreferredTaskID = newPref
+		}
+	} else {
+		// Don't fail the continuation on a decision-input refresh
+		// hiccup — fall through with the stale cfg. The worst case is
+		// the human-approval prompt we were trying to avoid, which is
+		// the same behavior as a transient store outage on the
+		// original request path.
+		h.Logger.WarnContext(r.Context(), "lite-proxy continuation decision-input refresh failed; using pre-continuation snapshot",
+			"request_id", requestID, "agent_id", agent.ID, "err", refreshErr.Error())
+	}
+	// Recursion is bounded by construction here: tryContinuation does
+	// not loop, so the second Postprocess pass below runs at most once
+	// per inbound harness request. If that second pass fires the
+	// auto-approve gate again, the gate's verdict still carries
+	// ContinueWithToolResult, but we never act on it — the caller
+	// (serve()) doesn't re-invoke tryContinuation. The verdict's
+	// SubstituteWith fallback renders as a terminal text turn instead,
+	// which is the right behavior for a model that re-emits a task-
+	// creation tool_use on the continuation.
+	newProcessed := llmproxy.Postprocess(r, full, contCT, cfg)
+	// Force Rewritten=true on a successful continuation swap. The
+	// body now comes from a SECOND upstream call whose length almost
+	// certainly differs from the first call's Content-Length (which
+	// serve() mirrored into w.Header at the top of the handler) and
+	// which may carry a different Content-Encoding. Without this flag,
+	// the second Postprocess can legitimately report Rewritten=false
+	// when the body itself was passthrough (plain text turn, no
+	// tool_use to rewrite) — and serve()'s `if processed.Rewritten`
+	// header-clear block would skip dropping Content-Length /
+	// Content-Encoding. Go would then truncate the harness write to
+	// the stale length or the harness would try to gunzip our
+	// plaintext. Co-locating the flag here (rather than in serve())
+	// keeps the invariant tight: any non-nil return from
+	// tryContinuation has had its origin headers invalidated by the
+	// upstream swap, and the caller can rely on Rewritten=true to
+	// route through the normal post-rewrite cleanup.
+	newProcessed.Rewritten = true
+
+	// User-facing notices. The auto-approve gate records a one-line
+	// notice on each verdict via PrependAssistantNotice; we collect
+	// them here and inject into the continuation's assistant turn so
+	// the user sees what was auto-approved at the top of the model's
+	// response. Multiple notices (one per auto-approved tool_use in
+	// a coalesced turn) join with newlines.
+	//
+	// Both pass results contribute. The first pass carries notices
+	// for whatever the gate fired on in the original assistant turn
+	// (always present in this branch since we got here on a
+	// continuation). The second pass can also fire the gate when
+	// the model re-emits POST /api/control/tasks?surface=inline in
+	// the continuation response — that second auto-approval falls
+	// back to SubstituteWith because recursion is capped at depth=1,
+	// but its notice still belongs in the visible turn for parity
+	// with the first task. Without this, two auto-approved tasks in
+	// the same inbound request would render with only the first
+	// notice and silently elide the second.
+	var notices []string
+	seen := map[string]struct{}{}
+	collect := func(decs []conversation.ToolUseDecisionRecord) {
+		for _, dec := range decs {
+			n := strings.TrimSpace(dec.Verdict.PrependAssistantNotice)
+			if n == "" {
+				continue
+			}
+			if _, ok := seen[n]; ok {
+				continue
+			}
+			seen[n] = struct{}{}
+			notices = append(notices, n)
+		}
+	}
+	collect(processed.Decisions)
+	collect(newProcessed.Decisions)
+	if len(notices) > 0 && len(newProcessed.Body) > 0 {
+		joined := strings.Join(notices, "\n")
+		pre, changed, prependErr := llmproxy.PrependAssistantNotice(provider, contCT, newProcessed.Body, joined)
+		switch {
+		case prependErr != nil:
+			// Prepend is UX polish, not correctness — log and return
+			// the unmodified body so the user still sees the model's
+			// output. The continuation itself succeeded.
+			h.Logger.WarnContext(r.Context(), "lite-proxy continuation notice prepend failed; returning unannotated body",
+				"request_id", requestID, "agent_id", agent.ID, "err", prependErr.Error())
+		case !changed:
+			// Prepend was a no-op: the dispatcher couldn't find a
+			// shape it recognized (response body lacked the expected
+			// `choices`/`output`/`content` marker, or Anthropic SSE
+			// was missing `message_start`). The audit row for the
+			// auto-approval still fired, but the only user-facing
+			// trace is gone. Warn so an operator chasing "I
+			// auto-approved but the user didn't see the notice"
+			// has a deterministic log entry.
+			h.Logger.WarnContext(r.Context(), "lite-proxy continuation notice prepend silently no-op'd (shape not recognized); user will not see auto-approval notice",
+				"request_id", requestID,
+				"agent_id", agent.ID,
+				"provider", string(provider),
+				"content_type", contCT,
+				"body_bytes", len(newProcessed.Body),
+			)
+		default:
+			newProcessed.Body = pre
+		}
+	}
+
+	return &newProcessed, resp.StatusCode, contCT, nil
 }
 
 // readResponseLimited mirrors readLimited for upstream responses. Default
@@ -1458,6 +1806,21 @@ func (h *LLMEndpointHandler) preprocessLiteSecretBody(w http.ResponseWriter, r *
 
 func agentLiteProxySecretDetectionDisabled(agent *store.Agent) bool {
 	return agent != nil && (agent.RuntimeSettings == nil || agent.RuntimeSettings.LiteProxySecretDetectionDisabled)
+}
+
+// agentConversationAutoApproveThreshold reads the per-agent
+// conversation-based auto-approval cap from the agent's runtime
+// settings. Defaults to "off" when no runtime settings row exists or
+// the agent itself is nil — matching the database column default so
+// pre-feature agents keep the human-approval prompt.
+func agentConversationAutoApproveThreshold(agent *store.Agent) string {
+	if agent == nil || agent.RuntimeSettings == nil {
+		return store.ConversationAutoApproveOff
+	}
+	if v := strings.TrimSpace(agent.RuntimeSettings.ConversationAutoApproveThreshold); v != "" {
+		return v
+	}
+	return store.ConversationAutoApproveOff
 }
 
 func (h *LLMEndpointHandler) maybeHandleLiteSecretDecision(w http.ResponseWriter, r *http.Request, agent *store.Agent, provider conversation.Provider, requestID string, body []byte, auditParams map[string]any, auditStatus *int, auditDecide, auditOutcome, auditReason *string) ([]byte, llmproxy.SecretDecisionAction, map[string]struct{}, bool) {
@@ -2693,13 +3056,25 @@ func (b *liteProxyTaskRiskBridge) AssessEnvelope(ctx context.Context, req llmpro
 		RequiredCredentials:    req.RequiredCredentials,
 		IntentVerificationMode: req.IntentVerificationMode,
 		ExpectedUse:            req.ExpectedUse,
+		RecentUserTurns:        req.RecentUserTurns,
 	})
 	if err != nil || out == nil {
 		return nil
 	}
+	conflicts := make([]llmproxy.TaskRiskConflict, 0, len(out.Conflicts))
+	for _, c := range out.Conflicts {
+		conflicts = append(conflicts, llmproxy.TaskRiskConflict{
+			Field:       c.Field,
+			Description: c.Description,
+			Severity:    c.Severity,
+		})
+	}
 	return &llmproxy.TaskRiskAssessment{
-		RiskLevel:   out.RiskLevel,
-		Explanation: out.Explanation,
-		Factors:     out.Factors,
+		RiskLevel:              out.RiskLevel,
+		Explanation:            out.Explanation,
+		Factors:                out.Factors,
+		Conflicts:              conflicts,
+		IntentMatch:            out.IntentMatch,
+		IntentMatchExplanation: out.IntentMatchExplanation,
 	}
 }
