@@ -239,13 +239,50 @@ func Postprocess(req *http.Request, body []byte, contentType string, cfg Postpro
 
 	auditAgent := auditAgentForCfg(cfg)
 
-	eval := func(tu conversation.ToolUse) conversation.ToolUseVerdict {
+	// Coalescence capture state. Pass 1 runs with a buffering wrapper
+	// over both PendingApprovals and the audit emission so we can:
+	//   * detect when multiple tool_uses in one turn need approval
+	//   * detect the inline-task path (Stage != StageTool) to skip
+	//     coalescence for it
+	//   * decide a final shape (legacy: replay buffers; coalesce:
+	//     discard buffers and write one coalesced hold + per-tool
+	//     coalesced-pending audit rows)
+	// Buffering — rather than passthrough-and-then-cleanup — closes
+	// two hazards. (a) Misleading audit: in passthrough mode, pass 1
+	// would emit "allow"/"rewrite" rows for siblings whose calls then
+	// get replaced by a coalesced approval; dashboards would believe
+	// they executed. (b) Spurious eviction: bounded caches near
+	// capacity could displace an unrelated older approval while N
+	// per-tool holds are temporarily resident. Buffering keeps the
+	// underlying state untouched until the final shape is decided.
+	originalPendingApprovals := cfg.PendingApprovals
+	holdSink := &capturedHoldSink{}
+	if originalPendingApprovals != nil {
+		cfg.PendingApprovals = newHoldCapturingApprovalCache(originalPendingApprovals, holdSink)
+	}
+	auditSink := &capturedAuditSink{}
+	var captures []evalCapture
+
+	innerEval := func(tu conversation.ToolUse) conversation.ToolUseVerdict {
 		var v inspector.Verdict
 		audit := func(decision, outcome, reason string) {
-			if cfg.Audit == nil || auditAgent == nil {
-				return
-			}
-			cfg.Audit.LogToolUseInspected(req.Context(), auditAgent, cfg.RequestID, tu, v, decision, outcome, reason)
+			// Always buffer, even when no AuditEmitter is configured.
+			// The outer eval wrapper reads the last entry for this
+			// call to capture inspector metadata for coalesce
+			// siblings (auto-allow / auto-rewrite calls that don't
+			// create a hold). Without unconditional buffering, a
+			// caller with cfg.Audit=nil would lose target_host/method/path
+			// for those siblings in the coalesced hold's Additional
+			// entries. The flush helpers already check cfg.Audit and
+			// short-circuit, so this costs only a few struct copies
+			// per call in audit-disabled deployments.
+			auditSink.entries = append(auditSink.entries, bufferedAudit{
+				ToolUse:  tu,
+				Verdict:  v,
+				Decision: decision,
+				Outcome:  outcome,
+				Reason:   reason,
+			})
 		}
 		// trace emits one JSONL line per decision point when
 		// cfg.Trace is configured. The kv slice is event-specific.
@@ -710,6 +747,50 @@ func Postprocess(req *http.Request, body []byte, contentType string, cfg Postpro
 		}
 	}
 
+	// Outer eval wraps innerEval and records the kind + decision
+	// context for the coalesce post-pass. Two side channels feed the
+	// capture:
+	//   * holdSink.holds — populated by the (buffered) PendingApprovals.Hold
+	//     wrapper when innerEval creates a per-tool hold. Carries the
+	//     hold ID, stage, and the full inspector/fingerprint/reason
+	//     bundle the eval body assembled before calling Hold.
+	//   * auditSink.entries — populated by the (buffered) audit closure
+	//     on every audit() call inside innerEval. The last entry for
+	//     this call carries the inspector verdict and the final reason
+	//     even when no hold was created (auto-allow, auto-rewrite,
+	//     hard deny). Without this, coalesced sibling release audit
+	//     rows would have empty target_host/method/path because no
+	//     hold captured them.
+	// Fingerprint is captured only via the hold sink, because the
+	// release path's EquivalentFingerprint check only fires for
+	// HeldKindApproval entries — non-approval siblings either pass
+	// through, deny outright, or fail-closed with "re-prompt needed."
+	eval := func(tu conversation.ToolUse) conversation.ToolUseVerdict {
+		holdsBefore, auditsBefore := 0, 0
+		if holdSink != nil {
+			holdsBefore = len(holdSink.holds)
+		}
+		if auditSink != nil {
+			auditsBefore = len(auditSink.entries)
+		}
+		v := innerEval(tu)
+		c := evalCapture{Use: tu, Kind: classifyVerdict(v)}
+		if holdSink != nil && len(holdSink.holds) > holdsBefore {
+			h := holdSink.holds[len(holdSink.holds)-1]
+			c.HoldID = h.Pending.ID
+			c.Stage = h.Pending.Stage
+			c.Inspector = h.Pending.Inspector
+			c.Fingerprint = h.Pending.Fingerprint
+			c.Reason = h.Pending.Reason
+		} else if auditSink != nil && len(auditSink.entries) > auditsBefore {
+			last := auditSink.entries[len(auditSink.entries)-1]
+			c.Inspector = last.Verdict
+			c.Reason = last.Reason
+		}
+		captures = append(captures, c)
+		return v
+	}
+
 	result, err := rewriter.Rewrite(body, contentType, eval)
 	if err != nil {
 		// Fail closed: the rewriter failed mid-body so we don't know
@@ -724,12 +805,162 @@ func Postprocess(req *http.Request, body []byte, contentType string, cfg Postpro
 			SkippedReason: "rewriter error: " + err.Error(),
 		}
 	}
+
+	// Coalesce decision. When the turn carries multiple tool_uses and
+	// at least one needs approval (and the inline-task flow is not in
+	// play), replace the buffered per-tool holds with one coalesced
+	// hold covering the whole turn and rewrite the buffered audit so
+	// it reports the calls as "coalesced approval pending" rather
+	// than as if they had executed. A single user yes/no then
+	// releases (or denies) all sibling calls together.
+	if originalPendingApprovals != nil && shouldCoalesceTurn(captures) {
+		coalesced := coalesceFromCaptures(captures)
+		coalesced.UserID = cfg.AgentUserID
+		coalesced.AgentID = cfg.AgentID
+		coalesced.Provider = rewriter.Name()
+		held, holdErr := originalPendingApprovals.Hold(req.Context(), coalesced)
+		if holdErr == nil {
+			// Coalesced hold committed. The buffered per-tool holds
+			// were never inserted into the underlying cache, so
+			// there's nothing to drop here — that closes the
+			// bounded-cache eviction hazard. The buffered audit rows
+			// are deliberately discarded: they would have reported
+			// "allow"/"rewrite" for siblings whose calls are now
+			// being held under the coalesced approval, which is
+			// false in the audit trail. We emit one
+			// "coalesced_approval_pending" row per held tool_use
+			// instead so dashboards see what actually happened.
+			emitCoalescedPendingAuditRows(req.Context(), cfg, auditAgent, captures, held.Pending.ID)
+			// Re-run the rewriter with a coalesced eval. Every
+			// tool_use returns Allowed:false; the first carries the
+			// combined prompt as SubstituteWith, the rest carry
+			// empty SubstituteWith so the rewriter's join produces
+			// one prompt (not N copies).
+			coalescedPrompt := coalescedApprovalPrompt(held.Pending.AllHolds())
+			firstReplaced := false
+			coalescedEval := func(tu conversation.ToolUse) conversation.ToolUseVerdict {
+				out := conversation.ToolUseVerdict{
+					Allowed: false,
+					Reason:  "Clawvisor: approval required (coalesced turn) — " + held.Pending.Reason,
+				}
+				if !firstReplaced {
+					out.SubstituteWith = coalescedPrompt
+					firstReplaced = true
+				}
+				return out
+			}
+			coalescedResult, coalescedErr := rewriter.Rewrite(body, contentType, coalescedEval)
+			if coalescedErr == nil {
+				return PostprocessResult{
+					Body:        coalescedResult.Body,
+					ContentType: contentType,
+					Rewritten:   true,
+					Decisions:   coalescedResult.Decisions,
+				}
+			}
+			// Coalesced re-run failed but the coalesced hold exists.
+			// The first-pass body still references per-tool prompts
+			// that no longer correspond to cache state (the
+			// per-tool holds were never committed and the coalesced
+			// hold is the only one now). Fall through to flush the
+			// buffered audit (the rows describe what would have
+			// happened) and return the first-pass body. Degraded
+			// but recoverable: a user yes/no resolves the coalesced
+			// hold via LIFO and the release synth emits every
+			// approved call.
+			flushBufferedAudit(req.Context(), cfg, auditAgent, auditSink)
+			return PostprocessResult{
+				Body:        result.Body,
+				ContentType: contentType,
+				Rewritten:   result.Rewritten,
+				Decisions:   result.Decisions,
+			}
+		}
+		// Hold-failure path: the coalesced hold could not be
+		// committed. Fall through to legacy replay: write the
+		// buffered per-tool holds to the underlying cache and flush
+		// the buffered audit rows. The first-pass body already
+		// describes those per-tool prompts; once they exist in the
+		// cache the user's yes/no resolves them one by one (the
+		// pre-coalesce path).
+	}
+
+	// Legacy replay: no coalescence happened (either shouldCoalesceTurn
+	// said no, or the coalesced Hold failed). Commit the buffered
+	// per-tool holds to the underlying cache and emit the buffered
+	// audit rows as-is.
+	if replayErr := replayBufferedHolds(req.Context(), cfg, originalPendingApprovals, holdSink, auditAgent, captures); replayErr != nil {
+		// Fail closed: the first-pass body references approval
+		// prompts whose holds couldn't be committed to the cache.
+		// Returning the body would invite the user to type "yes" at
+		// a prompt that resolves to nothing. Drop the body and
+		// surface a non-empty SkippedReason so the handler emits
+		// 502 — matches the pre-buffering eval path that returned
+		// "Clawvisor: approval unavailable" inline when Hold failed.
+		// Buffered audits are still flushed: they describe what
+		// would have happened, and the SkippedReason adds the
+		// approval-hold-storage row separately.
+		flushBufferedAudit(req.Context(), cfg, auditAgent, auditSink)
+		return PostprocessResult{
+			Body:          nil,
+			ContentType:   contentType,
+			SkippedReason: "approval hold storage failed: " + replayErr.Error(),
+		}
+	}
+	flushBufferedAudit(req.Context(), cfg, auditAgent, auditSink)
+
 	return PostprocessResult{
 		Body:        result.Body,
 		ContentType: contentType,
 		Rewritten:   result.Rewritten,
 		Decisions:   result.Decisions,
 	}
+}
+
+// coalesceFromCaptures builds the single PendingLiteApproval covering
+// every tool_use in a turn. The first approval-needing capture becomes
+// the primary (its decision context is mapped to the singular
+// ToolUse/Inspector/Fingerprint/Reason fields the rest of the codebase
+// already understands). PrimaryIndex records where the primary sat in
+// the original turn, so AllHolds() — and the release path that emits
+// from it — keep the model's tool_use order intact. Reordering would
+// break dependent sequences like Bash producing stdout that a
+// following WebFetch consumes.
+func coalesceFromCaptures(captures []evalCapture) PendingLiteApproval {
+	primaryIdx := -1
+	for i, c := range captures {
+		if c.Kind == HeldKindApproval {
+			primaryIdx = i
+			break
+		}
+	}
+	if primaryIdx < 0 {
+		// shouldCoalesceTurn would have returned false; treat as
+		// defensive guard so callers don't have to re-check.
+		primaryIdx = 0
+	}
+	primary := captures[primaryIdx]
+	pending := PendingLiteApproval{
+		ToolUse:      primary.Use,
+		Inspector:    primary.Inspector,
+		Fingerprint:  primary.Fingerprint,
+		Reason:       primary.Reason,
+		PrimaryIndex: primaryIdx,
+	}
+	pending.Additional = make([]HeldToolUse, 0, len(captures)-1)
+	for i, c := range captures {
+		if i == primaryIdx {
+			continue
+		}
+		pending.Additional = append(pending.Additional, HeldToolUse{
+			ToolUse:     c.Use,
+			Kind:        c.Kind,
+			Inspector:   c.Inspector,
+			Fingerprint: c.Fingerprint,
+			Reason:      c.Reason,
+		})
+	}
+	return pending
 }
 
 // ambiguousRefusalGuidance produces the substitute message the model
@@ -798,17 +1029,98 @@ func approvalPrompt(tu conversation.ToolUse, reason, approvalID string) string {
 	return b.String()
 }
 
+// coalescedApprovalPrompt renders the prompt for a hold that covers
+// multiple tool_uses in one turn. Offers approve/deny/task — the same
+// three verbs as the single-tool prompt. "task" against a coalesced
+// hold generates a task-definition prompt whose expected_tools
+// enumerates every distinct tool name in the batch (see
+// taskCreationPromptForHolds), so the user can promote the whole
+// batch into a durable scope in one gesture instead of approving
+// each call individually.
+//
+// The kinds slice parallels uses: each entry tags whether that use was
+// the trigger for approval or held alongside (auto-allow / auto-rewrite).
+func coalescedApprovalPrompt(uses []HeldToolUse) string {
+	var b strings.Builder
+	b.WriteString("Clawvisor paused this turn for approval (")
+	b.WriteString(strconv.Itoa(len(uses)))
+	b.WriteString(" tool calls).")
+	for i, held := range uses {
+		b.WriteString("\n\n")
+		b.WriteString(strconv.Itoa(i + 1))
+		b.WriteString(". ")
+		if name := strings.TrimSpace(held.ToolUse.Name); name != "" {
+			b.WriteString("`")
+			b.WriteString(name)
+			b.WriteString("`")
+		} else {
+			b.WriteString("(unnamed tool)")
+		}
+		switch held.Kind {
+		case HeldKindApproval:
+			if reason := strings.TrimSpace(held.Reason); reason != "" {
+				b.WriteString(" — approval required: ")
+				b.WriteString(reason)
+			} else {
+				b.WriteString(" — approval required")
+			}
+		case HeldKindAllow:
+			b.WriteString(" — held alongside (would auto-allow on its own)")
+		case HeldKindRewrite:
+			b.WriteString(" — held alongside (would auto-allow with credential rewrite on its own)")
+		}
+		if preview := conversation.MakeToolInputPreview(held.ToolUse.Input); preview != "" {
+			b.WriteString("\n   Input: ")
+			b.WriteString(preview)
+		}
+	}
+	b.WriteString("\n\nReply `yes` or `y` to approve all calls and run them in order, `no` or `n` to deny the whole turn, or `task` to scope this work under a Clawvisor task that covers every call above.")
+	return b.String()
+}
+
 func taskCreationPrompt(tu conversation.ToolUse) string {
-	toolName := strings.TrimSpace(tu.Name)
-	if toolName == "" {
+	return taskCreationPromptForHolds([]HeldToolUse{{ToolUse: tu, Kind: HeldKindApproval}})
+}
+
+// taskCreationPromptForHolds renders the task-creation prompt for one
+// or more held tool_uses. When len(holds) == 1 the output is
+// byte-identical to the legacy single-tool taskCreationPrompt — the
+// inline-task flow on a single hold is unchanged. When len(holds) > 1
+// (coalesced hold), `expected_tools` enumerates every distinct tool
+// name in the batch so the generated task scope covers every held
+// call. Without this, typing "task" on a coalesced approval prompt
+// would scope only the primary tool and leave sibling reviewed calls
+// to re-prompt on the next retry.
+func taskCreationPromptForHolds(holds []HeldToolUse) string {
+	if len(holds) == 0 {
+		return ""
+	}
+	// Deduplicate by tool name; keep insertion order so the rendered
+	// expected_tools mirrors the model's emit order (matters for
+	// dependent sequences readers will recognize). The why for a
+	// duplicated tool name comes from the FIRST tool_use of that
+	// name — taskToolWhy already produces a description broad enough
+	// to cover sibling calls (e.g. "Run shell commands needed for
+	// the task, including writes AND verification reads").
+	seen := map[string]bool{}
+	expected := make([]map[string]any, 0, len(holds))
+	for _, held := range holds {
+		name := strings.TrimSpace(held.ToolUse.Name)
+		if name == "" || seen[name] {
+			continue
+		}
+		seen[name] = true
+		expected = append(expected, map[string]any{
+			"tool_name": name,
+			"why":       taskToolWhy(held.ToolUse),
+		})
+	}
+	if len(expected) == 0 {
 		return ""
 	}
 	payload := map[string]any{
-		"purpose": "Describe the user-visible task you are trying to complete, including why this tool access is needed.",
-		"expected_tools": []map[string]any{{
-			"tool_name": toolName,
-			"why":       taskToolWhy(tu),
-		}},
+		"purpose":                  "Describe the user-visible task you are trying to complete, including why this tool access is needed.",
+		"expected_tools":           expected,
 		"intent_verification_mode": "strict",
 		"expires_in_seconds":       600,
 	}
