@@ -1,7 +1,7 @@
 import { useState, useEffect, useRef, useCallback, useMemo, type ReactNode } from 'react'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { Link, useSearchParams } from 'react-router-dom'
-import { api, type Task, type QueueItem, type Agent, type ActivityBucket, type VerificationVerdict, type ConnectionRequest, type ApprovalRecord, type RuntimeStatus } from '../api/client'
+import { api, APIError, type Task, type QueueItem, type Agent, type ActivityBucket, type VerificationVerdict, type ConnectionRequest, type ApprovalRecord, type RuntimeStatus } from '../api/client'
 import { filterLiveRuntimeApprovals, isActiveRuntimeSession } from './Runtime'
 import { useAuth } from '../hooks/useAuth'
 import { BarChart, Bar, XAxis, YAxis, Tooltip, ResponsiveContainer } from 'recharts'
@@ -34,7 +34,13 @@ export default function Overview() {
       setDeepLinkResult(`Request ${vars.requestId.slice(0, 8)}... approved.`)
       qc.invalidateQueries({ queryKey: ['overview'] })
     },
-    onError: (err: Error) => setDeepLinkResult(`Approve failed: ${err.message}`),
+    onError: (err: Error) => {
+      if (err instanceof APIError && err.code === 'INLINE_CHAT_BOUND') {
+        setDeepLinkResult('Reply approve/deny in the agent chat')
+      } else {
+        setDeepLinkResult(`Approve failed: ${err.message}`)
+      }
+    },
   })
   const deepDenyRequest = useMutation({
     mutationFn: ({ requestId, taskId }: DeepLinkVars) => api.approvals.deny(requestId, taskId),
@@ -42,7 +48,13 @@ export default function Overview() {
       setDeepLinkResult(`Request ${vars.requestId.slice(0, 8)}... denied.`)
       qc.invalidateQueries({ queryKey: ['overview'] })
     },
-    onError: (err: Error) => setDeepLinkResult(`Deny failed: ${err.message}`),
+    onError: (err: Error) => {
+      if (err instanceof APIError && err.code === 'INLINE_CHAT_BOUND') {
+        setDeepLinkResult('Reply approve/deny in the agent chat')
+      } else {
+        setDeepLinkResult(`Deny failed: ${err.message}`)
+      }
+    },
   })
 
   // Handle deep link actions for approvals

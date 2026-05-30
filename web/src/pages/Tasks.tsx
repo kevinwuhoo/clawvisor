@@ -1,7 +1,7 @@
 import { useState, useEffect } from 'react'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { useSearchParams, Link } from 'react-router-dom'
-import { api, type Agent } from '../api/client'
+import { api, APIError, type Agent } from '../api/client'
 import { useAuth } from '../hooks/useAuth'
 import TaskCard from '../components/TaskCard'
 
@@ -29,12 +29,24 @@ export default function Tasks() {
   const deepApprove = useMutation({
     mutationFn: (taskId: string) => api.tasks.approve(taskId),
     onSuccess: () => { setDeepLinkResult('Task approved.'); qc.invalidateQueries({ queryKey: ['tasks'] }) },
-    onError: (err: Error) => setDeepLinkResult(`Approve failed: ${err.message}`),
+    onError: (err: Error) => {
+      if (err instanceof APIError && err.code === 'INLINE_CHAT_BOUND') {
+        setDeepLinkResult('Reply approve/deny in the agent chat')
+      } else {
+        setDeepLinkResult(`Approve failed: ${err.message}`)
+      }
+    },
   })
   const deepDeny = useMutation({
     mutationFn: (taskId: string) => api.tasks.deny(taskId),
     onSuccess: () => { setDeepLinkResult('Task denied.'); qc.invalidateQueries({ queryKey: ['tasks'] }) },
-    onError: (err: Error) => setDeepLinkResult(`Deny failed: ${err.message}`),
+    onError: (err: Error) => {
+      if (err instanceof APIError && err.code === 'INLINE_CHAT_BOUND') {
+        setDeepLinkResult('Reply approve/deny in the agent chat')
+      } else {
+        setDeepLinkResult(`Deny failed: ${err.message}`)
+      }
+    },
   })
   const deepExpandApprove = useMutation({
     mutationFn: (taskId: string) => api.tasks.expandApprove(taskId),
