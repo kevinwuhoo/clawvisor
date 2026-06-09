@@ -14,6 +14,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/clawvisor/clawvisor/internal/api/handlers"
 	"github.com/clawvisor/clawvisor/internal/api/middleware"
@@ -22,6 +23,7 @@ import (
 	"github.com/clawvisor/clawvisor/internal/runtime/llmproxy"
 	"github.com/clawvisor/clawvisor/internal/runtime/llmproxy/inspector"
 	"github.com/clawvisor/clawvisor/internal/runtime/llmproxy/scriptjudge/llmjudge"
+	runtimetasks "github.com/clawvisor/clawvisor/internal/runtime/tasks"
 	"github.com/clawvisor/clawvisor/internal/taskrisk"
 	"github.com/clawvisor/clawvisor/pkg/adapters"
 	"github.com/clawvisor/clawvisor/pkg/config"
@@ -156,6 +158,12 @@ func Start(t *testing.T, scn *Scenario, keys Keys) (*Harness, error) {
 		}
 	}
 
+	seededPlaceholders, err := seedPreseededTasks(ctx, st, user.ID, agent.ID, scn.PreseededTasks)
+	if err != nil {
+		return nil, err
+	}
+	_ = seededPlaceholders // currently unused beyond seeding; reserved for future scenario assertions
+
 	logger := slog.New(slog.NewTextHandler(testLogWriter{t: t}, &slog.HandlerOptions{Level: slog.LevelWarn}))
 
 	cfgPtr := config.Default()
@@ -251,6 +259,16 @@ func Start(t *testing.T, scn *Scenario, keys Keys) (*Harness, error) {
 	controlHandler.ScriptSessions = scriptSessions
 	mux.Handle("POST /api/control/autovault/script-session", nonceMW(http.HandlerFunc(controlHandler.MintScriptSession)))
 	mux.Handle("GET /api/control/autovault/script", http.HandlerFunc(controlHandler.AutovaultScriptDocs))
+
+	// /api/control/tasks: lets the agent discover already-approved
+	// tasks (especially standing tasks carried over from prior
+	// conversations) before POSTing a fresh one. The counter proves
+	// the agent reached for discovery instead of blindly creating.
+	listTasks := nonceMW(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		counters.Inc(SeriesTasksListed)
+		controlHandler.ListTasks(w, r)
+	}))
+	mux.Handle("GET /api/control/tasks", listTasks)
 
 	// Mock upstream stands up before the resolver mount so the
 	// resolver's custom DialContext can target it directly.
@@ -423,6 +441,100 @@ func requestContainsAnyNeedle(r *http.Request, needles []string) bool {
 // provider-specific path themselves (e.g. /v1/messages).
 func (h *Harness) EndpointURL() string {
 	return h.Endpoint.URL
+}
+
+// seedPreseededTasks writes each PreseededTask into the store as an
+// active task owned by the scenario's user+agent, modeling an approval
+// the user granted in some prior conversation. Scope-relevant fields
+// (purpose, lifetime, expected_tools, expected_egress) come from the
+// YAML; everything else is filled in here. Any PreseededPlaceholder
+// entries are written as RuntimePlaceholder rows bound to the just-
+// created task — so a discovery scenario can model "the prior
+// conversation also minted a credential handle for this task." Returns
+// the list of seeded placeholder strings for downstream assertion.
+func seedPreseededTasks(ctx context.Context, st store.Store, userID, agentID string, seeds []PreseededTask) ([]string, error) {
+	if len(seeds) == 0 {
+		return nil, nil
+	}
+	now := time.Now().UTC()
+	var seededPlaceholders []string
+	for i, seed := range seeds {
+		if strings.TrimSpace(seed.Purpose) == "" {
+			return nil, fmt.Errorf("preseeded_tasks[%d]: purpose is required", i)
+		}
+		lifetime := seed.Lifetime
+		if lifetime == "" {
+			lifetime = "standing"
+		}
+		schemaVersion := seed.SchemaVersion
+		if schemaVersion == 0 {
+			schemaVersion = 2
+		}
+		// Convert through the canonical runtime types so the JSON we
+		// store uses the json-tagged shape (`tool_name`, `why`, …)
+		// that runtimetasks.EnvelopeFromTask + policy.MatchToolCall
+		// expect at scope-check time. Marshalling the YAML-tagged
+		// PreseededExpectedTool directly would emit `ToolName`,
+		// which the matcher won't see.
+		canonTools := make([]runtimetasks.ExpectedTool, 0, len(seed.ExpectedTools))
+		for _, t := range seed.ExpectedTools {
+			canonTools = append(canonTools, runtimetasks.ExpectedTool{
+				ToolName: t.ToolName,
+				Why:      t.Why,
+			})
+		}
+		canonEgress := make([]runtimetasks.ExpectedEgress, 0, len(seed.ExpectedEgress))
+		for _, e := range seed.ExpectedEgress {
+			canonEgress = append(canonEgress, runtimetasks.ExpectedEgress{
+				Host: e.Host,
+				Why:  e.Why,
+			})
+		}
+		expectedToolsJSON, err := json.Marshal(canonTools)
+		if err != nil {
+			return nil, fmt.Errorf("preseeded_tasks[%d]: marshal expected_tools: %w", i, err)
+		}
+		expectedEgressJSON, err := json.Marshal(canonEgress)
+		if err != nil {
+			return nil, fmt.Errorf("preseeded_tasks[%d]: marshal expected_egress: %w", i, err)
+		}
+		approvedAt := now
+		task := &store.Task{
+			UserID:                 userID,
+			AgentID:                agentID,
+			Purpose:                seed.Purpose,
+			Status:                 "active",
+			Lifetime:               lifetime,
+			ExpectedTools:          expectedToolsJSON,
+			ExpectedEgress:         expectedEgressJSON,
+			IntentVerificationMode: seed.IntentVerificationMode,
+			ExpectedUse:            seed.ExpectedUse,
+			SchemaVersion:          schemaVersion,
+			ApprovedAt:             &approvedAt,
+			ApprovalSource:         "manual",
+		}
+		if err := st.CreateTask(ctx, task); err != nil {
+			return nil, fmt.Errorf("preseeded_tasks[%d]: %w", i, err)
+		}
+		for j, ph := range seed.Placeholders {
+			if strings.TrimSpace(ph.Placeholder) == "" {
+				return nil, fmt.Errorf("preseeded_tasks[%d].placeholders[%d]: placeholder is required", i, j)
+			}
+			placeholder := &store.RuntimePlaceholder{
+				Placeholder: ph.Placeholder,
+				UserID:      userID,
+				AgentID:     agentID,
+				ServiceID:   ph.ServiceID,
+				VaultItemID: ph.VaultItemID,
+				TaskID:      task.ID,
+			}
+			if err := st.CreateRuntimePlaceholder(ctx, placeholder); err != nil {
+				return nil, fmt.Errorf("preseeded_tasks[%d].placeholders[%d]: %w", i, j, err)
+			}
+			seededPlaceholders = append(seededPlaceholders, ph.Placeholder)
+		}
+	}
+	return seededPlaceholders, nil
 }
 
 // CountActiveTasksForAgent reports how many active tasks belong to the
