@@ -137,6 +137,22 @@ func MaybeInterceptInlineExpansion(
 		return conversation.ToolUseVerdict{}, false
 	}
 
+	guard := NewDriftClaimGuard(req.Context(), cfg.ScopeDrifts, parsed.DriftID)
+	defer guard.Rollback()
+
+	if parsed.DriftID != "" {
+		_, claimedOk := guard.Claim(
+			cfg.AgentID,
+			cfg.ConversationID,
+			ScopeDriftOptionExpand,
+			"",
+			audit,
+		)
+		if !claimedOk {
+			return conversation.ToolUseVerdict{}, false
+		}
+	}
+
 	// Land the pending state in the DB before holding so the dashboard
 	// sees the in-flight expansion as a pending row even while the
 	// chat anchor owns the decide window. The creator runs the same
@@ -263,6 +279,7 @@ func MaybeInterceptInlineExpansion(
 			YesDescription: "Authorize the additional scope",
 		})
 	}
+	guard.Success()
 	return verdict, true
 }
 

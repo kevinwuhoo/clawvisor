@@ -225,6 +225,10 @@ type ScopeDriftRegistry interface {
 	// (agent, fingerprint).
 	SetOutcome(ctx context.Context, driftID string, outcome ScopeDriftOutcome) error
 
+	// RollbackClaim resets the ChosenOption, Outcome, and AgentNote fields of a drift back to empty.
+	// This should be called if an option was claimed but subsequent preflight setup/hold creation failed.
+	RollbackClaim(ctx context.Context, driftID string) error
+
 	// LookupPreClear checks whether the given (agent, fingerprint) has a
 	// succeeded drift whose pre-clear is still usable. Returns
 	// (driftID, true) on hit; ("", false) otherwise. The hit is CONSUMED
@@ -358,6 +362,23 @@ func (r *memoryScopeDriftRegistry) SetOutcome(_ context.Context, driftID string,
 	if outcome == ScopeDriftOutcomeSucceeded {
 		r.cleared[preClearKey(d.AgentID, d.Fingerprint())] = d.ID
 	}
+	return nil
+}
+
+func (r *memoryScopeDriftRegistry) RollbackClaim(_ context.Context, driftID string) error {
+	if r == nil {
+		return ErrDriftNotFound
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.pruneLocked()
+	d, ok := r.drifts[driftID]
+	if !ok {
+		return ErrDriftNotFound
+	}
+	d.ChosenOption = ""
+	d.Outcome = ""
+	d.AgentNote = ""
 	return nil
 }
 

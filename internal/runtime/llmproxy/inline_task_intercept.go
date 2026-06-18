@@ -165,6 +165,22 @@ func MaybeInterceptInlineTaskDefinition(
 		return conversation.ToolUseVerdict{}, false
 	}
 
+	guard := NewDriftClaimGuard(req.Context(), cfg.ScopeDrifts, parsed.DriftID)
+	defer guard.Rollback()
+
+	if parsed.DriftID != "" {
+		_, claimedOk := guard.Claim(
+			cfg.AgentID,
+			cfg.ConversationID,
+			ScopeDriftOptionNewTask,
+			"",
+			audit,
+		)
+		if !claimedOk {
+			return conversation.ToolUseVerdict{}, false
+		}
+	}
+
 	// Risk assessment runs BEFORE the hold so the auto-approval gate
 	// can decide whether to skip the human prompt entirely. The
 	// assessment is also used to render the prompt on the fall-through
@@ -232,6 +248,20 @@ func MaybeInterceptInlineTaskDefinition(
 				audit("fallthrough", "auto_approve_create_failed", createErr.Error())
 				trace("inline_task.auto_approve_create_failed", "err", createErr.Error())
 			} else {
+				if parsed.DriftID != "" {
+					if setErr := cfg.ScopeDrifts.SetOutcome(req.Context(), parsed.DriftID, ScopeDriftOutcomeSucceeded); setErr != nil {
+						audit("fallthrough", "auto_approve_set_outcome_failed", setErr.Error())
+						trace("inline_task.auto_approve_set_outcome_failed", "err", setErr.Error())
+						if cfg.Store != nil && created != nil && created.ID != "" {
+							rollbackCtx, cancel := context.WithTimeout(context.WithoutCancel(req.Context()), 5*time.Second)
+							defer cancel()
+							if err := cfg.Store.RevokeTask(rollbackCtx, created.ID, cfg.AgentUserID); err != nil {
+								trace("inline_task.auto_approve_outcome_rollback_failed", "task_id", created.ID, "err", err.Error())
+							}
+						}
+						return conversation.ToolUseVerdict{}, false
+					}
+				}
 				checkedOut := false
 				if cfg.Checkouts != nil && created.ID != "" {
 					// Include ConversationID for parity with the manual
@@ -283,6 +313,7 @@ func MaybeInterceptInlineTaskDefinition(
 				)
 				augmentation := inlineApprovedReplyAugmentationContext(created.ID, checkedOut, created.Credentials)
 				continuationPayload, _ := jsonsurgery.MarshalNoEscape(augmentation)
+				guard.Success()
 				return conversation.ToolUseVerdict{
 					Allowed: false,
 					Reason:  "Clawvisor: auto-approved from conversation context",
@@ -439,6 +470,7 @@ func MaybeInterceptInlineTaskDefinition(
 		// marker in the picker question.
 		verdict.SubstituteWithToolCall = buildAskUserQuestionToolCall(innerHold.Pending.ID)
 	}
+	guard.Success()
 	return verdict, true
 }
 

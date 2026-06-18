@@ -73,6 +73,10 @@ func (c *countingScopeDriftRegistry) SetOutcome(ctx context.Context, driftID str
 	return nil
 }
 
+func (c *countingScopeDriftRegistry) RollbackClaim(ctx context.Context, driftID string) error {
+	return c.inner.RollbackClaim(ctx, driftID)
+}
+
 func (c *countingScopeDriftRegistry) LookupPreClear(ctx context.Context, agentID, fingerprint string) (string, bool) {
 	driftID, ok := c.inner.LookupPreClear(ctx, agentID, fingerprint)
 	if ok {

@@ -1,6 +1,7 @@
 package llmproxy
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"net/http"
@@ -113,42 +114,18 @@ func MaybeInterceptScopeDriftOneOff(
 
 	ctx := req.Context()
 
-	// Cross-agent / cross-conversation guard BEFORE the claim: a drift
-	// minted for a different agent or conversation must not even be
-	// readable here. Rejecting at peek time prevents a copied or
-	// replayed drift_id from a different session from terminally
-	// closing the original drift — calling SetOutcome(Denied) after
-	// the claim succeeded would create a denial-of-service path where
-	// anyone who learns a drift_id can permanently close someone
-	// else's pending one-off. The legitimate session still owns the
-	// drift after this refusal.
-	existing, getErr := cfg.ScopeDrifts.Get(ctx, driftID)
-	if errors.Is(getErr, ErrDriftNotFound) {
-		audit("fallthrough", "inline_scope_drift_not_found", "drift "+driftID+" not found (it may have expired)")
-		return conversation.ToolUseVerdict{}, false
-	}
-	if getErr != nil {
-		audit("fallthrough", "inline_scope_drift_lookup_failed", getErr.Error())
-		return conversation.ToolUseVerdict{}, false
-	}
-	if existing.AgentID != cfg.AgentID || existing.ConversationID != cfg.ConversationID {
-		audit("fallthrough", "inline_scope_drift_wrong_agent_or_conversation", "drift "+driftID+" was minted for a different agent or conversation")
-		return conversation.ToolUseVerdict{}, false
-	}
+	guard := NewDriftClaimGuard(ctx, cfg.ScopeDrifts, driftID)
+	defer guard.Rollback()
 
-	claimed, err := cfg.ScopeDrifts.ClaimOption(ctx, driftID, ScopeDriftOptionOneOff, rationale)
-	if errors.Is(err, ErrDriftNotFound) {
-		// Race: drift expired between the peek and the claim. Treat
-		// as not-found rather than crashing the request.
-		audit("fallthrough", "inline_scope_drift_not_found", "drift "+driftID+" not found (it may have expired)")
-		return conversation.ToolUseVerdict{}, false
-	}
-	if errors.Is(err, ErrDriftAlreadyResolved) {
-		audit("fallthrough", "inline_scope_drift_already_resolved", "drift "+driftID+" was already resolved with option "+string(claimed.ChosenOption))
-		return conversation.ToolUseVerdict{}, false
-	}
-	if err != nil {
-		audit("fallthrough", "inline_scope_drift_claim_failed", err.Error())
+	// Centralized check-and-claim.
+	claimed, claimedOk := guard.Claim(
+		cfg.AgentID,
+		cfg.ConversationID,
+		ScopeDriftOptionOneOff,
+		rationale,
+		audit,
+	)
+	if !claimedOk {
 		return conversation.ToolUseVerdict{}, false
 	}
 
@@ -167,9 +144,6 @@ func MaybeInterceptScopeDriftOneOff(
 		ExpiresAt:           now.Add(inlineTaskApprovalHoldTTL),
 	})
 	if holdErr != nil {
-		// Cache hold failed — close the drift so it isn't stranded
-		// pending until TTL.
-		_ = cfg.ScopeDrifts.SetOutcome(ctx, claimed.ID, ScopeDriftOutcomeDenied)
 		audit("fallthrough", "inline_scope_drift_hold_failed", holdErr.Error()+"; deferring to dashboard rewrite")
 		return conversation.ToolUseVerdict{}, false
 	}
@@ -180,9 +154,95 @@ func MaybeInterceptScopeDriftOneOff(
 		"drift_id", claimed.ID,
 		"signal", "query",
 	)
+	guard.Success()
 	return conversation.ToolUseVerdict{
 		Allowed:        false,
 		Reason:         "Clawvisor: one-off approval pending — " + claimed.Service + "." + claimed.Action,
 		SubstituteWith: renderScopeDriftOneOffPrompt(claimed, hold.Pending.ID),
 	}, true
+}
+
+// DriftClaimGuard manages the lifecycle of claiming a scope drift and rolling it back if
+// the interceptor path fails downstream.
+type DriftClaimGuard struct {
+	ctx      context.Context
+	registry ScopeDriftRegistry
+	driftID  string
+	claimed  bool
+	success  bool
+}
+
+// NewDriftClaimGuard creates a new DriftClaimGuard.
+func NewDriftClaimGuard(ctx context.Context, registry ScopeDriftRegistry, driftID string) *DriftClaimGuard {
+	return &DriftClaimGuard{
+		ctx:      ctx,
+		registry: registry,
+		driftID:  driftID,
+	}
+}
+
+// Claim validates that the drift belongs to the expected agent and conversation, and claims it.
+func (g *DriftClaimGuard) Claim(
+	expectedAgentID string,
+	expectedConversationID string,
+	option ScopeDriftOption,
+	agentNote string,
+	audit func(decision, outcome, reason string),
+) (ScopeDrift, bool) {
+	if g.driftID == "" {
+		return ScopeDrift{}, true
+	}
+	if g.registry == nil {
+		audit("fallthrough", "inline_scope_drift_registry_missing", "registry not configured")
+		return ScopeDrift{}, false
+	}
+
+	existing, err := g.registry.Get(g.ctx, g.driftID)
+	if errors.Is(err, ErrDriftNotFound) {
+		audit("fallthrough", "inline_scope_drift_not_found", "drift "+g.driftID+" not found (it may have expired)")
+		return ScopeDrift{}, false
+	}
+	if err != nil {
+		audit("fallthrough", "inline_scope_drift_lookup_failed", err.Error())
+		return ScopeDrift{}, false
+	}
+
+	if existing.AgentID != expectedAgentID || existing.ConversationID != expectedConversationID {
+		audit("fallthrough", "inline_scope_drift_wrong_agent_or_conversation", "drift "+g.driftID+" was minted for a different agent or conversation")
+		return ScopeDrift{}, false
+	}
+
+	claimed, err := g.registry.ClaimOption(g.ctx, g.driftID, option, agentNote)
+	if errors.Is(err, ErrDriftNotFound) {
+		audit("fallthrough", "inline_scope_drift_not_found", "drift "+g.driftID+" not found (it may have expired)")
+		return ScopeDrift{}, false
+	}
+	if errors.Is(err, ErrDriftAlreadyResolved) {
+		audit("fallthrough", "inline_scope_drift_already_resolved", "drift "+g.driftID+" was already resolved with option "+string(claimed.ChosenOption))
+		return ScopeDrift{}, false
+	}
+	if err != nil {
+		audit("fallthrough", "inline_scope_drift_claim_failed", err.Error())
+		return ScopeDrift{}, false
+	}
+
+	g.claimed = true
+	return claimed, true
+}
+
+// Success marks the claimed drift as successfully intercepted, preventing rollback.
+func (g *DriftClaimGuard) Success() {
+	g.success = true
+}
+
+// Rollback rolls back the claimed drift option if the claim succeeded but the interceptor
+// exited early without success. Should be deferred immediately after guard creation.
+func (g *DriftClaimGuard) Rollback() {
+	if !g.claimed || g.success || g.registry == nil || g.driftID == "" {
+		return
+	}
+	// Use detached context so a canceled request context doesn't strand the rollback.
+	rollbackCtx, cancel := context.WithTimeout(context.WithoutCancel(g.ctx), 5*time.Second)
+	defer cancel()
+	_ = g.registry.RollbackClaim(rollbackCtx, g.driftID)
 }

@@ -93,8 +93,8 @@ func anthropicReplyBody(verb, approvalID string) []byte {
 func invokeOneOffIntercept(t *testing.T, reg ScopeDriftRegistry, cache PendingApprovalCache, agentID, convID, driftID, rationale string) (conversation.ToolUseVerdict, bool) {
 	t.Helper()
 	cfg := PostprocessConfig{
-		AgentContext:    AgentContext{AgentID: agentID, AgentUserID: driftTestUserID},
-		AuditContext:    AuditContext{ConversationID: convID},
+		AgentContext: AgentContext{AgentID: agentID, AgentUserID: driftTestUserID},
+		AuditContext: AuditContext{ConversationID: convID},
 		AuthorizationContext: AuthorizationContext{
 			ScopeDrifts: reg,
 		},
@@ -117,15 +117,15 @@ func invokeOneOffIntercept(t *testing.T, reg ScopeDriftRegistry, cache PendingAp
 // TestScopeDriftE2E_OneOffApprove walks the POST → user-approve →
 // pre-clear path:
 //
-//	1. agent POSTs /api/control/scope-drifts/<id>/one-off?surface=inline
-//	   with a one-line rationale
-//	2. MaybeInterceptScopeDriftOneOff claims the option + opens a
-//	   StageAwaitingScopeDriftOneOff hold + substitutes the tool_result
-//	   with the user-facing approval prompt
-//	3. user replies "yes <approval_id>"
-//	4. RewriteScopeDriftOneOffApprovalReply resolves the hold + sets
-//	   the drift outcome to Succeeded + mints the pre-clear
-//	5. agent's retry of the original tool_use consumes the pre-clear once
+//  1. agent POSTs /api/control/scope-drifts/<id>/one-off?surface=inline
+//     with a one-line rationale
+//  2. MaybeInterceptScopeDriftOneOff claims the option + opens a
+//     StageAwaitingScopeDriftOneOff hold + substitutes the tool_result
+//     with the user-facing approval prompt
+//  3. user replies "yes <approval_id>"
+//  4. RewriteScopeDriftOneOffApprovalReply resolves the hold + sets
+//     the drift outcome to Succeeded + mints the pre-clear
+//  5. agent's retry of the original tool_use consumes the pre-clear once
 func TestScopeDriftE2E_OneOffApprove(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
@@ -483,15 +483,15 @@ func TestScopeDriftE2E_ImplicitFallThroughTTLExpires(t *testing.T) {
 // TestScopeDriftE2E_ExpandFullStateMachine drives the (a) Expand
 // path:
 //
-//	1. agent reads the menu, POSTs to .../tasks/<id>/expand?surface=inline
-//	   with a `drift_id` field in the body
-//	2. MaybeInterceptInlineExpansion opens a hold at
-//	   StageAwaitingExpansionApproval AND records the drift link
-//	3. user replies "yes" → RewriteInlineTaskApprovalReply resolves,
-//	   the expansion creator is approved, AND ScopeDrifts.SetOutcome
-//	   fires with Succeeded → pre-clear minted
-//	4. agent's retry of the original blocked tool_use consumes the
-//	   pre-clear once
+//  1. agent reads the menu, POSTs to .../tasks/<id>/expand?surface=inline
+//     with a `drift_id` field in the body
+//  2. MaybeInterceptInlineExpansion opens a hold at
+//     StageAwaitingExpansionApproval AND records the drift link
+//  3. user replies "yes" → RewriteInlineTaskApprovalReply resolves,
+//     the expansion creator is approved, AND ScopeDrifts.SetOutcome
+//     fires with Succeeded → pre-clear minted
+//  4. agent's retry of the original blocked tool_use consumes the
+//     pre-clear once
 func TestScopeDriftE2E_ExpandFullStateMachine(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
@@ -525,6 +525,9 @@ func TestScopeDriftE2E_ExpandFullStateMachine(t *testing.T) {
 		},
 		AuditContext: AuditContext{
 			ConversationID: driftTestConvID,
+		},
+		AuthorizationContext: AuthorizationContext{
+			ScopeDrifts: reg,
 		},
 		ApprovalContext: ApprovalContext{
 			PendingApprovals:  cache,
@@ -621,9 +624,10 @@ func TestScopeDriftE2E_ExpandDenyClosesDriftWithoutPreClear(t *testing.T) {
 	}
 	fc := &fakeExpansionCreator{}
 	cfg := PostprocessConfig{
-		AgentContext:    AgentContext{AgentID: driftTestAgentID, AgentUserID: driftTestUserID},
-		AuditContext:    AuditContext{ConversationID: driftTestConvID},
-		ApprovalContext: ApprovalContext{PendingApprovals: cache, InlineTaskCreator: fc},
+		AgentContext:         AgentContext{AgentID: driftTestAgentID, AgentUserID: driftTestUserID},
+		AuditContext:         AuditContext{ConversationID: driftTestConvID},
+		AuthorizationContext: AuthorizationContext{ScopeDrifts: reg},
+		ApprovalContext:      ApprovalContext{PendingApprovals: cache, InlineTaskCreator: fc},
 	}
 	httpReq := httptest.NewRequest("POST", "http://daemon/api/control/tasks/task-A/expand?surface=inline", nil)
 	if _, ok := MaybeInterceptInlineExpansion(httpReq, cfg, func(string, string, string) {}, func(string, ...any) {}, conversation.ProviderAnthropic, tu, ControlCall{Method: "POST", URL: httpReq.URL}); !ok {
@@ -695,9 +699,10 @@ func TestScopeDriftE2E_NewTaskFullStateMachine(t *testing.T) {
 		resp: &InlineApprovedTask{ID: "task-created", Status: "active", Purpose: "File the issue"},
 	}
 	cfg := PostprocessConfig{
-		AgentContext:    AgentContext{AgentID: driftTestAgentID, AgentUserID: driftTestUserID, AgentName: "agent-drift"},
-		AuditContext:    AuditContext{ConversationID: driftTestConvID},
-		ApprovalContext: ApprovalContext{PendingApprovals: cache, InlineTaskCreator: fc},
+		AgentContext:         AgentContext{AgentID: driftTestAgentID, AgentUserID: driftTestUserID, AgentName: "agent-drift"},
+		AuditContext:         AuditContext{ConversationID: driftTestConvID},
+		AuthorizationContext: AuthorizationContext{ScopeDrifts: reg},
+		ApprovalContext:      ApprovalContext{PendingApprovals: cache, InlineTaskCreator: fc},
 	}
 	httpReq := httptest.NewRequest("POST", "http://daemon/api/control/tasks?surface=inline", nil)
 	call := ControlCall{Method: "POST", URL: httpReq.URL}
@@ -1037,4 +1042,537 @@ func peekAllHolds(ctx context.Context, cache *MemoryPendingApprovalCache) []Pend
 	out := make([]PendingLiteApproval, len(items))
 	copy(out, items)
 	return out
+}
+
+// TestScopeDriftE2E_ExpandCrossAgentGuard verifies that an expand request from a different
+// agent or conversation using a victim's drift_id is rejected.
+func TestScopeDriftE2E_ExpandCrossAgentGuard(t *testing.T) {
+	t.Parallel()
+	reg := NewMemoryScopeDriftRegistry(0)
+	cache := NewMemoryPendingApprovalCache(time.Minute)
+	drift, _ := mintDriftFixture(t, reg, ScopeDriftSourceTaskScope)
+
+	expandBody := map[string]any{
+		"expected_tools": []map[string]any{{"tool_name": "Bash", "why": "x"}},
+		"reason":         "x",
+		"drift_id":       drift.ID,
+	}
+	expandBodyJSON, _ := json.Marshal(expandBody)
+	tu := conversation.ToolUse{
+		ID:    "tu-expand",
+		Name:  "Bash",
+		Input: json.RawMessage(`{"body":` + string(mustJSON(string(expandBodyJSON))) + `}`),
+	}
+
+	fc := &fakeExpansionCreator{}
+	cfg := PostprocessConfig{
+		AgentContext:         AgentContext{AgentID: "agent-attacker", AgentUserID: driftTestUserID},
+		AuditContext:         AuditContext{ConversationID: driftTestConvID},
+		AuthorizationContext: AuthorizationContext{ScopeDrifts: reg},
+		ApprovalContext:      ApprovalContext{PendingApprovals: cache, InlineTaskCreator: fc},
+	}
+	httpReq := httptest.NewRequest("POST", "http://daemon/api/control/tasks/task-A/expand?surface=inline", nil)
+	call := ControlCall{Method: "POST", URL: httpReq.URL}
+
+	if _, claimed := MaybeInterceptInlineExpansion(httpReq, cfg, func(string, string, string) {}, func(string, ...any) {}, conversation.ProviderAnthropic, tu, call); claimed {
+		t.Fatal("expected expand from different agent to be rejected")
+	}
+
+	// Also check different conversation!
+	cfg2 := PostprocessConfig{
+		AgentContext:         AgentContext{AgentID: driftTestAgentID, AgentUserID: driftTestUserID},
+		AuditContext:         AuditContext{ConversationID: "conv-attacker"}, // Different conversation!
+		AuthorizationContext: AuthorizationContext{ScopeDrifts: reg},
+		ApprovalContext:      ApprovalContext{PendingApprovals: cache, InlineTaskCreator: fc},
+	}
+	if _, claimed := MaybeInterceptInlineExpansion(httpReq, cfg2, func(string, string, string) {}, func(string, ...any) {}, conversation.ProviderAnthropic, tu, call); claimed {
+		t.Fatal("expected expand from different conversation to be rejected")
+	}
+}
+
+// TestScopeDriftE2E_OneShotCapExpandAndOneOff verifies that submitting an expand request
+// successfully claims the drift, and a subsequent one-off request against the same drift_id
+// fails with ErrDriftAlreadyResolved.
+func TestScopeDriftE2E_OneShotCapExpandAndOneOff(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	reg := NewMemoryScopeDriftRegistry(0)
+	cache := NewMemoryPendingApprovalCache(time.Minute)
+	drift, _ := mintDriftFixture(t, reg, ScopeDriftSourceTaskScope)
+
+	// Step 1: Submit an expand request. It should successfully claim the drift.
+	expandBody := map[string]any{
+		"expected_tools": []map[string]any{{"tool_name": "Bash", "why": "x"}},
+		"reason":         "x",
+		"drift_id":       drift.ID,
+	}
+	expandBodyJSON, _ := json.Marshal(expandBody)
+	tu := conversation.ToolUse{
+		ID:    "tu-expand",
+		Name:  "Bash",
+		Input: json.RawMessage(`{"body":` + string(mustJSON(string(expandBodyJSON))) + `}`),
+	}
+
+	fc := &fakeExpansionCreator{}
+	cfg := PostprocessConfig{
+		AgentContext:         AgentContext{AgentID: driftTestAgentID, AgentUserID: driftTestUserID},
+		AuditContext:         AuditContext{ConversationID: driftTestConvID},
+		AuthorizationContext: AuthorizationContext{ScopeDrifts: reg},
+		ApprovalContext:      ApprovalContext{PendingApprovals: cache, InlineTaskCreator: fc},
+	}
+	httpReq := httptest.NewRequest("POST", "http://daemon/api/control/tasks/task-A/expand?surface=inline", nil)
+	call := ControlCall{Method: "POST", URL: httpReq.URL}
+
+	if _, claimed := MaybeInterceptInlineExpansion(httpReq, cfg, func(string, string, string) {}, func(string, ...any) {}, conversation.ProviderAnthropic, tu, call); !claimed {
+		t.Fatal("expected expand intercept to claim the drift")
+	}
+
+	// Verify drift is now claimed with "expand".
+	stored, err := reg.Get(ctx, drift.ID)
+	if err != nil {
+		t.Fatalf("get drift: %v", err)
+	}
+	if stored.ChosenOption != ScopeDriftOptionExpand {
+		t.Fatalf("drift ChosenOption = %q, want %q", stored.ChosenOption, ScopeDriftOptionExpand)
+	}
+
+	// Step 2: Try a subsequent one-off request against the same drift_id. It should fail.
+	_, claimed := invokeOneOffIntercept(t, reg, cache, driftTestAgentID, driftTestConvID, drift.ID, "need a one-off too")
+	if claimed {
+		t.Fatal("expected one-off intercept to reject already claimed drift")
+	}
+
+	// Verify that the drift ChosenOption remains "expand" (was not wiped by the one-off's deferred rollback).
+	stored, err = reg.Get(ctx, drift.ID)
+	if err != nil {
+		t.Fatalf("get drift: %v", err)
+	}
+	if stored.ChosenOption != ScopeDriftOptionExpand {
+		t.Fatalf("drift ChosenOption was wiped! got %q, want %q", stored.ChosenOption, ScopeDriftOptionExpand)
+	}
+}
+
+// TestScopeDriftE2E_ExpandCreatorFailureClosesDrift verifies that if CreatePendingInlineExpansion
+// fails, the drift outcome is transitioned to Denied.
+func TestScopeDriftE2E_ExpandCreatorFailureClosesDrift(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	reg := NewMemoryScopeDriftRegistry(0)
+	cache := NewMemoryPendingApprovalCache(time.Minute)
+	drift, _ := mintDriftFixture(t, reg, ScopeDriftSourceTaskScope)
+
+	expandBody := map[string]any{
+		"expected_tools": []map[string]any{{"tool_name": "Bash", "why": "x"}},
+		"reason":         "x",
+		"drift_id":       drift.ID,
+	}
+	expandBodyJSON, _ := json.Marshal(expandBody)
+	tu := conversation.ToolUse{
+		ID:    "tu-expand",
+		Name:  "Bash",
+		Input: json.RawMessage(`{"body":` + string(mustJSON(string(expandBodyJSON))) + `}`),
+	}
+
+	// This expansion creator returns an error to simulate DB/creator failure.
+	fc := &fakeExpansionCreator{
+		CreatePendingErr: errors.New("database outage"),
+	}
+	cfg := PostprocessConfig{
+		AgentContext:         AgentContext{AgentID: driftTestAgentID, AgentUserID: driftTestUserID},
+		AuditContext:         AuditContext{ConversationID: driftTestConvID},
+		AuthorizationContext: AuthorizationContext{ScopeDrifts: reg},
+		ApprovalContext:      ApprovalContext{PendingApprovals: cache, InlineTaskCreator: fc},
+	}
+	httpReq := httptest.NewRequest("POST", "http://daemon/api/control/tasks/task-A/expand?surface=inline", nil)
+	call := ControlCall{Method: "POST", URL: httpReq.URL}
+
+	if _, claimed := MaybeInterceptInlineExpansion(httpReq, cfg, func(string, string, string) {}, func(string, ...any) {}, conversation.ProviderAnthropic, tu, call); claimed {
+		t.Fatal("expected expansion to fall through due to creator failure")
+	}
+
+	// Verify that the drift outcome and chosen option were rolled back (cleared).
+	stored, err := reg.Get(ctx, drift.ID)
+	if err != nil {
+		t.Fatalf("get drift: %v", err)
+	}
+	if stored.Outcome != "" {
+		t.Fatalf("drift Outcome = %q, want empty", stored.Outcome)
+	}
+	if stored.ChosenOption != "" {
+		t.Fatalf("drift ChosenOption = %q, want empty", stored.ChosenOption)
+	}
+
+	// Verify we can claim the drift again (it is not stranded or permanently resolved).
+	if _, err := reg.ClaimOption(ctx, drift.ID, ScopeDriftOptionExpand, "retry"); err != nil {
+		t.Fatalf("expected drift to be claimable again, but got err: %v", err)
+	}
+}
+
+// TestScopeDriftE2E_NewTaskPendingCreatorFailureClosesDrift verifies that if CreatePendingInlineTask
+// fails, the drift outcome is transitioned to Denied.
+func TestScopeDriftE2E_NewTaskPendingCreatorFailureClosesDrift(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	reg := NewMemoryScopeDriftRegistry(0)
+	cache := NewMemoryPendingApprovalCache(time.Minute)
+	drift, _ := mintDriftFixture(t, reg, ScopeDriftSourceTaskScope)
+
+	taskBody := &runtimetasks.TaskCreateRequest{
+		Purpose:                "File the issue",
+		IntentVerificationMode: "strict",
+		ExpiresInSeconds:       600,
+		ExpectedTools: []runtimetasks.ExpectedTool{
+			{ToolName: "Bash", Why: "curl to github"},
+		},
+		DriftID: drift.ID,
+	}
+	taskBodyJSON, _ := json.Marshal(taskBody)
+	tu := conversation.ToolUse{
+		ID:    "tu-create",
+		Name:  "Bash",
+		Input: json.RawMessage(`{"body":` + string(mustJSON(string(taskBodyJSON))) + `}`),
+	}
+
+	// This creator returns an error on pending task creation.
+	fc := &fakeInlineTaskCreator{
+		pendingErr: errors.New("database outage"),
+	}
+	cfg := PostprocessConfig{
+		AgentContext:         AgentContext{AgentID: driftTestAgentID, AgentUserID: driftTestUserID, AgentName: "agent-drift"},
+		AuditContext:         AuditContext{ConversationID: driftTestConvID},
+		AuthorizationContext: AuthorizationContext{ScopeDrifts: reg},
+		ApprovalContext:      ApprovalContext{PendingApprovals: cache, InlineTaskCreator: fc},
+	}
+	httpReq := httptest.NewRequest("POST", "http://daemon/api/control/tasks?surface=inline", nil)
+	call := ControlCall{Method: "POST", URL: httpReq.URL}
+
+	if _, ok := MaybeInterceptInlineTaskDefinition(httpReq, cfg, func(string, string, string) {}, func(string, ...any) {}, conversation.ProviderAnthropic, tu, call); ok {
+		t.Fatal("expected task definition intercept to fall through due to creator failure")
+	}
+
+	// Verify that the drift outcome and chosen option were rolled back (cleared).
+	stored, err := reg.Get(ctx, drift.ID)
+	if err != nil {
+		t.Fatalf("get drift: %v", err)
+	}
+	if stored.Outcome != "" {
+		t.Fatalf("drift Outcome = %q, want empty", stored.Outcome)
+	}
+	if stored.ChosenOption != "" {
+		t.Fatalf("drift ChosenOption = %q, want empty", stored.ChosenOption)
+	}
+
+	// Verify we can claim the drift again (it is not stranded or permanently resolved).
+	if _, err := reg.ClaimOption(ctx, drift.ID, ScopeDriftOptionNewTask, "retry"); err != nil {
+		t.Fatalf("expected drift to be claimable again, but got err: %v", err)
+	}
+}
+
+// TestScopeDriftE2E_NewTaskAutoApproveResolvesDriftSucceeded verifies that if a task is
+// auto-approved, the drift is successfully resolved immediately without human prompting.
+func TestScopeDriftE2E_NewTaskAutoApproveResolvesDriftSucceeded(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	reg := NewMemoryScopeDriftRegistry(0)
+	cache := NewMemoryPendingApprovalCache(time.Minute)
+	drift, _ := mintDriftFixture(t, reg, ScopeDriftSourceTaskScope)
+
+	taskBody := &runtimetasks.TaskCreateRequest{
+		Purpose:                "File the issue",
+		IntentVerificationMode: "strict",
+		ExpiresInSeconds:       600,
+		ExpectedTools: []runtimetasks.ExpectedTool{
+			{ToolName: "Bash", Why: "curl to github"},
+		},
+		DriftID: drift.ID,
+	}
+	taskBodyJSON, _ := json.Marshal(taskBody)
+	tu := conversation.ToolUse{
+		ID:    "tu-create",
+		Name:  "Bash",
+		Input: json.RawMessage(`{"body":` + string(mustJSON(string(taskBodyJSON))) + `}`),
+	}
+
+	fc := &fakeInlineTaskCreator{
+		resp: &InlineApprovedTask{ID: "task-created", Status: "active", Purpose: "File the issue"},
+	}
+	assessor := &mockTaskRiskAssessor{
+		verdict: &TaskRiskAssessment{
+			RiskLevel:   "low",
+			IntentMatch: "yes",
+		},
+	}
+	cfg := PostprocessConfig{
+		AgentContext:         AgentContext{AgentID: driftTestAgentID, AgentUserID: driftTestUserID, AgentName: "agent-drift"},
+		AuditContext:         AuditContext{ConversationID: driftTestConvID},
+		AuthorizationContext: AuthorizationContext{ScopeDrifts: reg},
+		ApprovalContext: ApprovalContext{
+			PendingApprovals:                 cache,
+			InlineTaskCreator:                fc,
+			TaskRiskAssessor:                 assessor,
+			ConversationAutoApproveThreshold: "low",
+			RecentUserTurns:                  []string{"please file the issue immediately"},
+		},
+	}
+	httpReq := httptest.NewRequest("POST", "http://daemon/api/control/tasks?surface=inline", nil)
+	call := ControlCall{Method: "POST", URL: httpReq.URL}
+
+	verdict, ok := MaybeInterceptInlineTaskDefinition(httpReq, cfg, func(string, string, string) {}, func(string, ...any) {}, conversation.ProviderAnthropic, tu, call)
+	if !ok {
+		t.Fatal("expected task definition intercept to claim the request")
+	}
+	if verdict.Continue == nil {
+		t.Fatal("expected auto-approve continue signal to be present")
+	}
+
+	// Verify that the drift outcome was marked as Succeeded.
+	stored, err := reg.Get(ctx, drift.ID)
+	if err != nil {
+		t.Fatalf("get drift: %v", err)
+	}
+	if stored.Outcome != ScopeDriftOutcomeSucceeded {
+		t.Fatalf("drift Outcome = %q, want %q", stored.Outcome, ScopeDriftOutcomeSucceeded)
+	}
+}
+
+// TestScopeDriftE2E_NewTaskAutoApproveCreatorFailureRollsBackDrift verifies that if task auto-approval
+// triggers but the creator fails to build the task, the drift claim is rolled back and the request falls through.
+func TestScopeDriftE2E_NewTaskAutoApproveCreatorFailureRollsBackDrift(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	reg := NewMemoryScopeDriftRegistry(0)
+	cache := NewMemoryPendingApprovalCache(time.Minute)
+	drift, _ := mintDriftFixture(t, reg, ScopeDriftSourceTaskScope)
+
+	taskBody := &runtimetasks.TaskCreateRequest{
+		Purpose:                "File the issue",
+		IntentVerificationMode: "strict",
+		ExpiresInSeconds:       600,
+		ExpectedTools: []runtimetasks.ExpectedTool{
+			{ToolName: "Bash", Why: "curl to github"},
+		},
+		DriftID: drift.ID,
+	}
+	taskBodyJSON, _ := json.Marshal(taskBody)
+	tu := conversation.ToolUse{
+		ID:    "tu-create",
+		Name:  "Bash",
+		Input: json.RawMessage(`{"body":` + string(mustJSON(string(taskBodyJSON))) + `}`),
+	}
+
+	// Mock a creator error for both auto-approval task creation and pending creation.
+	fc := &fakeInlineTaskCreator{
+		err:        errors.New("auto-approve task creation failed"),
+		pendingErr: errors.New("pending task creation failed"),
+	}
+	assessor := &mockTaskRiskAssessor{
+		verdict: &TaskRiskAssessment{
+			RiskLevel:   "low",
+			IntentMatch: "yes",
+		},
+	}
+	cfg := PostprocessConfig{
+		AgentContext:         AgentContext{AgentID: driftTestAgentID, AgentUserID: driftTestUserID, AgentName: "agent-drift"},
+		AuditContext:         AuditContext{ConversationID: driftTestConvID},
+		AuthorizationContext: AuthorizationContext{ScopeDrifts: reg},
+		ApprovalContext: ApprovalContext{
+			PendingApprovals:                 cache,
+			InlineTaskCreator:                fc,
+			TaskRiskAssessor:                 assessor,
+			ConversationAutoApproveThreshold: "low",
+			RecentUserTurns:                  []string{"please file the issue immediately"},
+		},
+	}
+	httpReq := httptest.NewRequest("POST", "http://daemon/api/control/tasks?surface=inline", nil)
+	call := ControlCall{Method: "POST", URL: httpReq.URL}
+
+	_, ok := MaybeInterceptInlineTaskDefinition(httpReq, cfg, func(string, string, string) {}, func(string, ...any) {}, conversation.ProviderAnthropic, tu, call)
+	if ok {
+		t.Fatal("expected task definition intercept to return false (fallthrough) due to creation failure")
+	}
+
+	// Verify that the drift outcome and chosen option were rolled back (cleared).
+	stored, err := reg.Get(ctx, drift.ID)
+	if err != nil {
+		t.Fatalf("get drift: %v", err)
+	}
+	if stored.Outcome != "" {
+		t.Fatalf("drift Outcome = %q, want empty", stored.Outcome)
+	}
+	if stored.ChosenOption != "" {
+		t.Fatalf("drift ChosenOption = %q, want empty", stored.ChosenOption)
+	}
+
+	// Verify we can claim the drift again (it was successfully rolled back).
+	if _, err := reg.ClaimOption(ctx, drift.ID, ScopeDriftOptionNewTask, "retry"); err != nil {
+		t.Fatalf("expected drift to be claimable again, but got err: %v", err)
+	}
+}
+
+// TestScopeDriftE2E_NewTaskAutoApproveCreatorFailureFallsBackToManual verifies that if task auto-approval
+// triggers but task creation fails, the interceptor falls back to manual approval and successfully creates a hold.
+func TestScopeDriftE2E_NewTaskAutoApproveCreatorFailureFallsBackToManual(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	reg := NewMemoryScopeDriftRegistry(0)
+	cache := NewMemoryPendingApprovalCache(time.Minute)
+	drift, _ := mintDriftFixture(t, reg, ScopeDriftSourceTaskScope)
+
+	taskBody := &runtimetasks.TaskCreateRequest{
+		Purpose:                "File the issue",
+		IntentVerificationMode: "strict",
+		ExpiresInSeconds:       600,
+		ExpectedTools: []runtimetasks.ExpectedTool{
+			{ToolName: "Bash", Why: "curl to github"},
+		},
+		DriftID: drift.ID,
+	}
+	taskBodyJSON, _ := json.Marshal(taskBody)
+	tu := conversation.ToolUse{
+		ID:    "tu-create",
+		Name:  "Bash",
+		Input: json.RawMessage(`{"body":` + string(mustJSON(string(taskBodyJSON))) + `}`),
+	}
+
+	// Creator fails on auto-approve task creation, but succeeds on manual pending task creation.
+	fc := &fakeInlineTaskCreator{
+		err:        errors.New("auto-approve task creation failed"),
+		pendingErr: nil, // succeeds
+	}
+	assessor := &mockTaskRiskAssessor{
+		verdict: &TaskRiskAssessment{
+			RiskLevel:   "low",
+			IntentMatch: "yes",
+		},
+	}
+	cfg := PostprocessConfig{
+		AgentContext:         AgentContext{AgentID: driftTestAgentID, AgentUserID: driftTestUserID, AgentName: "agent-drift"},
+		AuditContext:         AuditContext{ConversationID: driftTestConvID},
+		AuthorizationContext: AuthorizationContext{ScopeDrifts: reg},
+		ApprovalContext: ApprovalContext{
+			PendingApprovals:                 cache,
+			InlineTaskCreator:                fc,
+			TaskRiskAssessor:                 assessor,
+			ConversationAutoApproveThreshold: "low",
+			RecentUserTurns:                  []string{"please file the issue immediately"},
+		},
+	}
+	httpReq := httptest.NewRequest("POST", "http://daemon/api/control/tasks?surface=inline", nil)
+	call := ControlCall{Method: "POST", URL: httpReq.URL}
+
+	_, ok := MaybeInterceptInlineTaskDefinition(httpReq, cfg, func(string, string, string) {}, func(string, ...any) {}, conversation.ProviderAnthropic, tu, call)
+	if !ok {
+		t.Fatal("expected task definition intercept to return true (intercepted via manual fallback)")
+	}
+
+	// Verify that a hold is created.
+	holds := peekAllHolds(ctx, cache)
+	if len(holds) != 1 {
+		t.Fatalf("expected 1 hold to be created, got %d", len(holds))
+	}
+
+	// Verify that the drift outcome remains pending and option is new_task (not rolled back).
+	stored, err := reg.Get(ctx, drift.ID)
+	if err != nil {
+		t.Fatalf("get drift: %v", err)
+	}
+	if stored.Outcome != ScopeDriftOutcomePending {
+		t.Fatalf("drift Outcome = %q, want pending", stored.Outcome)
+	}
+	if stored.ChosenOption != ScopeDriftOptionNewTask {
+		t.Fatalf("drift ChosenOption = %q, want new_task", stored.ChosenOption)
+	}
+}
+
+type mockTaskRiskAssessor struct {
+	verdict *TaskRiskAssessment
+}
+
+func (m *mockTaskRiskAssessor) AssessEnvelope(_ context.Context, _ TaskRiskAssessRequest) *TaskRiskAssessment {
+	return m.verdict
+}
+
+type failingOutcomeRegistry struct {
+	ScopeDriftRegistry
+	failSetOutcome bool
+}
+
+func (r *failingOutcomeRegistry) SetOutcome(ctx context.Context, driftID string, outcome ScopeDriftOutcome) error {
+	if r.failSetOutcome {
+		return errors.New("database connection lost during outcome write")
+	}
+	return r.ScopeDriftRegistry.SetOutcome(ctx, driftID, outcome)
+}
+
+// TestScopeDriftE2E_NewTaskAutoApproveSetOutcomeFailureRollsBackDrift verifies that if task auto-approval
+// triggers and task creation succeeds, but the registry write for SetOutcome(Succeeded) fails, the claim is
+// rolled back and the request falls through.
+func TestScopeDriftE2E_NewTaskAutoApproveSetOutcomeFailureRollsBackDrift(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	innerReg := NewMemoryScopeDriftRegistry(0)
+	reg := &failingOutcomeRegistry{ScopeDriftRegistry: innerReg, failSetOutcome: true}
+	cache := NewMemoryPendingApprovalCache(time.Minute)
+	drift, _ := mintDriftFixture(t, reg, ScopeDriftSourceTaskScope)
+
+	taskBody := &runtimetasks.TaskCreateRequest{
+		Purpose:                "File the issue",
+		IntentVerificationMode: "strict",
+		ExpiresInSeconds:       600,
+		ExpectedTools: []runtimetasks.ExpectedTool{
+			{ToolName: "Bash", Why: "curl to github"},
+		},
+		DriftID: drift.ID,
+	}
+	taskBodyJSON, _ := json.Marshal(taskBody)
+	tu := conversation.ToolUse{
+		ID:    "tu-create",
+		Name:  "Bash",
+		Input: json.RawMessage(`{"body":` + string(mustJSON(string(taskBodyJSON))) + `}`),
+	}
+
+	// Creator succeeds on task creation, but SetOutcome will fail.
+	fc := &fakeInlineTaskCreator{}
+	assessor := &mockTaskRiskAssessor{
+		verdict: &TaskRiskAssessment{
+			RiskLevel:   "low",
+			IntentMatch: "yes",
+		},
+	}
+	cfg := PostprocessConfig{
+		AgentContext:         AgentContext{AgentID: driftTestAgentID, AgentUserID: driftTestUserID, AgentName: "agent-drift"},
+		AuditContext:         AuditContext{ConversationID: driftTestConvID},
+		AuthorizationContext: AuthorizationContext{ScopeDrifts: reg},
+		ApprovalContext: ApprovalContext{
+			PendingApprovals:                 cache,
+			InlineTaskCreator:                fc,
+			TaskRiskAssessor:                 assessor,
+			ConversationAutoApproveThreshold: "low",
+			RecentUserTurns:                  []string{"please file the issue immediately"},
+		},
+	}
+	httpReq := httptest.NewRequest("POST", "http://daemon/api/control/tasks?surface=inline", nil)
+	call := ControlCall{Method: "POST", URL: httpReq.URL}
+
+	_, ok := MaybeInterceptInlineTaskDefinition(httpReq, cfg, func(string, string, string) {}, func(string, ...any) {}, conversation.ProviderAnthropic, tu, call)
+	if ok {
+		t.Fatal("expected task definition intercept to return false (fallthrough) due to SetOutcome failure")
+	}
+
+	// Verify that the drift outcome and chosen option were rolled back (cleared).
+	stored, err := reg.Get(ctx, drift.ID)
+	if err != nil {
+		t.Fatalf("get drift: %v", err)
+	}
+	if stored.Outcome != "" {
+		t.Fatalf("drift Outcome = %q, want empty", stored.Outcome)
+	}
+	if stored.ChosenOption != "" {
+		t.Fatalf("drift ChosenOption = %q, want empty", stored.ChosenOption)
+	}
+
+	// Verify we can claim the drift again (it was successfully rolled back).
+	if _, err := reg.ClaimOption(ctx, drift.ID, ScopeDriftOptionNewTask, "retry"); err != nil {
+		t.Fatalf("expected drift to be claimable again, but got err: %v", err)
+	}
 }

@@ -11,6 +11,7 @@ import (
 
 	"github.com/clawvisor/clawvisor/internal/runtime/conversation"
 	runtimetasks "github.com/clawvisor/clawvisor/internal/runtime/tasks"
+	"github.com/clawvisor/clawvisor/internal/taskrisk"
 	"github.com/clawvisor/clawvisor/pkg/store"
 )
 
@@ -18,12 +19,13 @@ import (
 // so tests can verify both the inputs (parsed body, original tool_use)
 // AND control the outputs (success/failure, returned task body).
 type fakeInlineTaskCreator struct {
-	called    bool
-	gotAgent  *store.Agent
-	gotReq    *runtimetasks.TaskCreateRequest
-	gotOrigID string
-	resp      *InlineApprovedTask
-	err       error
+	called     bool
+	gotAgent   *store.Agent
+	gotReq     *runtimetasks.TaskCreateRequest
+	gotOrigID  string
+	resp       *InlineApprovedTask
+	err        error
+	pendingErr error
 }
 
 func (f *fakeInlineTaskCreator) CreateInlineApprovedTask(_ context.Context, agent *store.Agent, req *runtimetasks.TaskCreateRequest, originalToolUseID string) (*InlineApprovedTask, error) {
@@ -35,6 +37,25 @@ func (f *fakeInlineTaskCreator) CreateInlineApprovedTask(_ context.Context, agen
 		return nil, f.err
 	}
 	return f.resp, nil
+}
+
+func (f *fakeInlineTaskCreator) CreatePendingInlineTask(_ context.Context, _ *store.Agent, _ *runtimetasks.TaskCreateRequest, _ string, _ *taskrisk.RiskAssessment) (string, error) {
+	if f.pendingErr != nil {
+		return "", f.pendingErr
+	}
+	return "task-created-pending", nil
+}
+
+func (f *fakeInlineTaskCreator) ApproveInlineTask(_ context.Context, _, _ string) (*InlineApprovedTask, error) {
+	return f.resp, f.err
+}
+
+func (f *fakeInlineTaskCreator) DenyInlineTask(_ context.Context, _, _ string) error {
+	return f.err
+}
+
+func (f *fakeInlineTaskCreator) ExpireInlineTask(_ context.Context, _, _ string) error {
+	return f.err
 }
 
 // seedInlineTaskHolds primes the cache the way the postprocess intercept
