@@ -62,38 +62,47 @@ func Postprocess(req *http.Request, body []byte, contentType string, cfg llmprox
 	}
 
 	innerEval := session.evaluator(req, rewriter.Name(), preExtracted)
+	ctx := req.Context()
 
-	// Capture per-tool verdicts so the finalizer can classify them.
+	// Eval pass: compute every verdict up-front and apply the
+	// recoverable→placeholder transform. Runs BEFORE commit so commit
+	// can promote transient-deny verdicts (commit calls Try on the
+	// budget; on promote, it sets RecoverableReason and re-runs the
+	// placeholder transform). Pre-looping also means the real rewrite
+	// below just looks up the post-commit verdicts instead of running
+	// transforms during emission.
 	verdictByTU = make(map[string]conversation.ToolUseVerdict, len(preExtracted))
-	eval := func(tu conversation.ToolUse) conversation.ToolUseVerdict {
+	for _, tu := range preExtracted {
 		v := innerEval(tu)
 		v = transformRecoverableDenyToPlaceholder(v, tu, cfg)
 		verdictByTU[tu.ID] = v
-		return v
 	}
 
 	if collectorErr != nil {
-		// The collector may have parsed tool_uses before failing later
-		// in the body. Evaluate only those parsed tools so any pending
-		// inline-task rows they create are rolled back below; the audit
-		// rows describe this local policy/rollback work, not an upstream
-		// tool call that reached the harness.
-		for _, tu := range preExtracted {
-			eval(tu)
-		}
+		// Eval pass already populated verdictByTU for whatever the
+		// collector parsed before failing; the rollback below sweeps
+		// any inline-task rows those evaluations created.
 		return failClosed("rewriter error during tool_use extraction: " + collectorErr.Error())
 	}
 
-	result, err := rewriter.Rewrite(body, contentType, eval)
+	if commitErr := session.commitVerdictSideEffects(ctx, verdictByTU, preExtracted); commitErr != nil {
+		return failClosed("verdict side-effect commit failed: " + commitErr.Error())
+	}
+
+	// Real rewrite: eval is a direct lookup against the post-commit
+	// verdict map. A tool_use the collector didn't surface yields a
+	// zero-value verdict (Allowed=false) — safe denial rather than
+	// the bypass-commit path an on-demand fallback would create. The
+	// collector and real rewrite walk the same body, so a divergence
+	// here is a parser bug that should surface in tests, not get
+	// silently masked.
+	result, err := rewriter.Rewrite(body, contentType, func(tu conversation.ToolUse) conversation.ToolUseVerdict {
+		return verdictByTU[tu.ID]
+	})
 	if err != nil {
 		// Fail closed: the rewriter failed mid-body so we don't know
 		// whether a credentialed placeholder survived into the response.
 		return failClosed("rewriter error: " + err.Error())
-	}
-
-	ctx := req.Context()
-	if commitErr := session.commitVerdictSideEffects(ctx, verdictByTU, preExtracted); commitErr != nil {
-		return failClosed("verdict side-effect commit failed: " + commitErr.Error())
 	}
 	finalResult, finalErr := session.finalize(ctx, preExtracted, verdictByTU)
 	if finalErr != nil {
