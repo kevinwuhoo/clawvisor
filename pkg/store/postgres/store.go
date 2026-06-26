@@ -900,6 +900,13 @@ func (s *Store) UpdateAuditOutcome(ctx context.Context, id, outcome, errMsg stri
 	return err
 }
 
+func (s *Store) UpdateAuditFiltersApplied(ctx context.Context, id string, filters json.RawMessage) error {
+	_, err := s.pool.Exec(ctx,
+		`UPDATE audit_log SET filters_applied = $1 WHERE id = $2`,
+		nilIfEmpty(filters), id)
+	return err
+}
+
 // auditColumns is the canonical SELECT list for audit_log rows in the postgres
 // store. Kept in sync with scanAuditRow; deduped_of trails so symmetric-dedup
 // callers (FindDedupCandidate, GetAuditEntryByRequestID) can filter on the

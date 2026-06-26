@@ -118,6 +118,18 @@ func (s *localTestStore) UpdateAuditOutcome(_ context.Context, id, outcome, errM
 	return nil
 }
 
+func (s *localTestStore) UpdateAuditFiltersApplied(_ context.Context, id string, filters json.RawMessage) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, e := range s.auditEntries {
+		if e.ID == id {
+			e.FiltersApplied = append(json.RawMessage(nil), filters...)
+			return nil
+		}
+	}
+	return nil
+}
+
 func (s *localTestStore) LogGatewayRequest(_ context.Context, entry *store.GatewayRequestLog) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()

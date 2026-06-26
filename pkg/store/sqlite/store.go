@@ -1064,6 +1064,18 @@ func (s *Store) UpdateAuditOutcome(ctx context.Context, id, outcome, errMsg stri
 	return err
 }
 
+func (s *Store) UpdateAuditFiltersApplied(ctx context.Context, id string, filters json.RawMessage) error {
+	var value *string
+	if len(filters) > 0 {
+		str := string(filters)
+		value = &str
+	}
+	_, err := s.db.ExecContext(ctx,
+		`UPDATE audit_log SET filters_applied = ? WHERE id = ?`,
+		value, id)
+	return err
+}
+
 // auditColumns is the canonical SELECT list for audit_log rows. Kept in
 // sync with scanAuditRow below; both deliberately include deduped_of as
 // the trailing column so the symmetric-dedup partial-unique index can

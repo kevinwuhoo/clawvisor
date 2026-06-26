@@ -3,8 +3,12 @@ package sqlite
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"testing"
 	"testing/fstest"
+	"time"
+
+	"github.com/clawvisor/clawvisor/pkg/store"
 )
 
 func TestRunMigrationsFSIsTransactional(t *testing.T) {
@@ -41,5 +45,45 @@ func TestRunMigrationsFSIsTransactional(t *testing.T) {
 	}
 	if migrationCount != 0 {
 		t.Fatalf("expected failed migration to remain unrecorded, count=%d", migrationCount)
+	}
+}
+
+func TestUpdateAuditFiltersApplied(t *testing.T) {
+	ctx := context.Background()
+	db, err := New(ctx, t.TempDir()+"/test.db")
+	if err != nil {
+		t.Fatalf("sqlite.New: %v", err)
+	}
+	st := NewStore(db)
+	t.Cleanup(func() { _ = st.Close() })
+
+	user, err := st.CreateUser(ctx, "user-1@example.com", "hash")
+	if err != nil {
+		t.Fatalf("CreateUser: %v", err)
+	}
+	entry := &store.AuditEntry{
+		ID:         "audit-filter-1",
+		UserID:     user.ID,
+		RequestID:  "req-1",
+		Timestamp:  time.Now(),
+		Service:    "google.gmail",
+		Action:     "get_message",
+		ParamsSafe: json.RawMessage(`{}`),
+		Decision:   "execute",
+		Outcome:    "pending",
+	}
+	if err := st.LogAudit(ctx, entry); err != nil {
+		t.Fatalf("LogAudit: %v", err)
+	}
+	filters := json.RawMessage(`{"gateway_hooks":{"GatewayPostToolCall":[{"name":"privacy-filter"}]}}`)
+	if err := st.UpdateAuditFiltersApplied(ctx, entry.ID, filters); err != nil {
+		t.Fatalf("UpdateAuditFiltersApplied: %v", err)
+	}
+	got, err := st.GetAuditEntry(ctx, entry.ID, entry.UserID)
+	if err != nil {
+		t.Fatalf("GetAuditEntry: %v", err)
+	}
+	if string(got.FiltersApplied) != string(filters) {
+		t.Fatalf("FiltersApplied = %s, want %s", got.FiltersApplied, filters)
 	}
 }
