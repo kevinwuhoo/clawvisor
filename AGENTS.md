@@ -18,7 +18,9 @@ Important areas:
 
 The scope drift system (`internal/runtime/llmproxy/scope_drift_*.go`) intercepts blocked tool calls and surfaces a continuation menu back to the agent before reaching the user. The agent can expand the active task, create a new task inline, or request a one-off approval with a rationale — only the one-off path reaches the user. Treat this system as security-sensitive: it controls which agents can bypass task scope restrictions and under what conditions.
 
-The highest-risk areas are authorization, task scope evaluation, scope drift enforcement, credential/vault handling, adapter execution, approval behavior, callback signing, audit logging, and anything that could expose tokens, secrets, or unsanitized downstream data. Treat behavior changes in these areas as security-sensitive.
+The highest-risk areas are authorization, task scope evaluation, scope drift enforcement, credential/vault handling, adapter execution, gateway hook behavior, approval behavior, callback signing, audit logging, and anything that could expose tokens, secrets, or unsanitized downstream data. Treat behavior changes in these areas as security-sensitive.
+
+`gateway_hooks` / `GatewayPostToolCall` behavior is security-sensitive because hooks can see and mutate adapter results before they reach agents, callbacks, or chain-context extraction. Do not log raw hook payloads, hook responses, credentials, tokens, or full downstream bodies.
 
 ## Development
 

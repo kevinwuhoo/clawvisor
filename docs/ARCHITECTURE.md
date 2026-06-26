@@ -102,11 +102,13 @@ When a request is authorized (either via task auto-execute or human approval), e
 
 3. **Adapter Execution**: The decrypted credential is passed to the adapter's `Execute()` method along with the action and params. The adapter makes the real API call (Gmail API, GitHub API, Slack API, etc.) and returns a semantically formatted `Result` with a human-readable `summary` and structured `data`.
 
-4. **Audit Logging**: The audit entry (created before execution) is updated with the outcome, execution duration, and verification verdict.
+4. **Gateway Post-Tool-Call Hooks** (optional): If `gateway_hooks` are enabled, Clawvisor sends the adapter result to matching external HTTP hooks. Hooks may return an updated result. The hook-updated result is the only result used for HTTP responses, callbacks, and chain-context extraction. Hook metadata is stored in `audit_log.filters_applied`.
 
-5. **Response**: The agent receives `status: "executed"` with the result.
+5. **Audit Logging**: The audit entry (created before execution) is updated with the outcome, execution duration, verification verdict, and any gateway hook metadata.
 
-6. **Callback Delivery**: If the agent provided a `callback_url`, the result is POSTed there asynchronously. The callback includes an HMAC-SHA256 signature in the `X-Clawvisor-Signature` header so the agent can verify authenticity.
+6. **Response**: The agent receives `status: "executed"` with the final result.
+
+7. **Callback Delivery**: If the agent provided a `callback_url`, the final result is POSTed there asynchronously. The callback includes an HMAC-SHA256 signature in the `X-Clawvisor-Signature` header so the agent can verify authenticity.
 
 ### 2.7 Async Resolution
 
@@ -396,7 +398,7 @@ Migrations are embedded in the binary and run automatically on startup. Each mig
 - `pending_approvals` — serialized request blobs awaiting human decision. Includes callback URL, status (`pending` or `approved`), expiry, and audit ID. Unique on `request_id`.
 
 **Audit:**
-- `audit_log` — every gateway request. Includes service, action, sanitized params, decision, outcome, verification verdict, duration, and error messages. Legacy columns (`safety_flagged`, `safety_reason`, `filters_applied`) are retained for backward compatibility but no longer populated. `request_id` has a UNIQUE constraint. Indexed on `(user_id, timestamp)`, `(user_id, outcome)`, `(user_id, service)`.
+- `audit_log` — every gateway request. Includes service, action, sanitized params, decision, outcome, verification verdict, duration, error messages, and gateway hook metadata in `filters_applied`. Legacy columns (`safety_flagged`, `safety_reason`) are retained for backward compatibility. `request_id` has a UNIQUE constraint. Indexed on `(user_id, timestamp)`, `(user_id, outcome)`, `(user_id, service)`.
 
 **Notifications:**
 - `notification_configs` — per-user channel configs (e.g., Telegram bot token + chat ID). Unique on `(user_id, channel)`.
