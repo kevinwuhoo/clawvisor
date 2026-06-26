@@ -28,6 +28,7 @@ type Config struct {
 	Callback      CallbackConfig      `yaml:"callback"`
 	Task          TaskConfig          `yaml:"task"`
 	Gateway       GatewayConfig       `yaml:"gateway"`
+	GatewayHooks  GatewayHooksConfig  `yaml:"gateway_hooks" json:"gateway_hooks"`
 	LLM           LLMConfig           `yaml:"llm"`
 	MCP           MCPConfig           `yaml:"mcp"`
 	RuntimeProxy  RuntimeProxyConfig  `yaml:"runtime_proxy"`
@@ -49,6 +50,31 @@ type Config struct {
 type GatewayConfig struct {
 	ContentDedupTTLSeconds int `yaml:"content_dedup_ttl_seconds"` // default: 5
 	NPSSamplePercent       int `yaml:"nps_sample_percent"`        // 0-100, default: 1
+}
+
+type GatewayHooksConfig struct {
+	Enabled bool                                `yaml:"enabled" json:"enabled"`
+	Events  map[string][]GatewayHookEventConfig `yaml:"events" json:"events"`
+}
+
+type GatewayHookEventConfig struct {
+	Matcher  GatewayHookMatcherConfig   `yaml:"matcher" json:"matcher"`
+	Handlers []GatewayHookHandlerConfig `yaml:"handlers" json:"handlers"`
+}
+
+type GatewayHookMatcherConfig struct {
+	Service string `yaml:"service" json:"service"`
+	Action  string `yaml:"action" json:"action"`
+}
+
+type GatewayHookHandlerConfig struct {
+	Name                string `yaml:"name" json:"name"`
+	Type                string `yaml:"type" json:"type"`
+	URL                 string `yaml:"url" json:"url"`
+	TimeoutSeconds      int    `yaml:"timeout_seconds" json:"timeout_seconds"`
+	FailureMode         string `yaml:"failure_mode" json:"failure_mode"`
+	AllowResponseUpdate bool   `yaml:"allow_response_update" json:"allow_response_update"`
+	SecretEnv           string `yaml:"secret_env" json:"secret_env"`
 }
 
 // RelayConfig holds settings for the cloud relay connection.
@@ -374,6 +400,10 @@ func Default() *Config {
 		Gateway: GatewayConfig{
 			ContentDedupTTLSeconds: 5,
 			NPSSamplePercent:       1,
+		},
+		GatewayHooks: GatewayHooksConfig{
+			Enabled: false,
+			Events:  map[string][]GatewayHookEventConfig{},
 		},
 		LLM: LLMConfig{
 			Provider:       "anthropic",
@@ -739,6 +769,13 @@ func Load(path string) (*Config, error) {
 			cfg.Gateway.NPSSamplePercent = n
 		}
 	}
+	if v := os.Getenv("CLAWVISOR_GATEWAY_HOOKS_JSON"); strings.TrimSpace(v) != "" {
+		var hooks GatewayHooksConfig
+		if err := yaml.Unmarshal([]byte(v), &hooks); err != nil {
+			return nil, fmt.Errorf("parsing CLAWVISOR_GATEWAY_HOOKS_JSON: %w", err)
+		}
+		cfg.GatewayHooks = hooks
+	}
 	if v := os.Getenv("CLAWVISOR_RUNTIME_PROXY_ENABLED"); v != "" {
 		cfg.RuntimeProxy.Enabled = v == "true" || v == "1"
 	}
@@ -900,6 +937,51 @@ func splitCSV(v string) []string {
 	return out
 }
 
+func (g GatewayHooksConfig) Validate() error {
+	if !g.Enabled {
+		return nil
+	}
+	for eventName, entries := range g.Events {
+		if eventName != "GatewayPostToolCall" {
+			return fmt.Errorf("gateway_hooks.events contains unsupported event %q", eventName)
+		}
+		for i, entry := range entries {
+			if strings.TrimSpace(entry.Matcher.Service) == "" {
+				return fmt.Errorf("gateway_hooks.events.%s[%d].matcher.service must be set", eventName, i)
+			}
+			if strings.TrimSpace(entry.Matcher.Action) == "" {
+				return fmt.Errorf("gateway_hooks.events.%s[%d].matcher.action must be set", eventName, i)
+			}
+			if len(entry.Handlers) == 0 {
+				return fmt.Errorf("gateway_hooks.events.%s[%d].handlers must contain at least one handler", eventName, i)
+			}
+			for j, handler := range entry.Handlers {
+				if strings.TrimSpace(handler.Name) == "" {
+					return fmt.Errorf("gateway_hooks.events.%s[%d].handlers[%d].name must be set", eventName, i, j)
+				}
+				if strings.TrimSpace(handler.Type) != "http" {
+					return fmt.Errorf("gateway_hooks.events.%s[%d].handlers[%d].type must be http", eventName, i, j)
+				}
+				if strings.TrimSpace(handler.URL) == "" {
+					return fmt.Errorf("gateway_hooks.events.%s[%d].handlers[%d].url must be set", eventName, i, j)
+				}
+				if handler.TimeoutSeconds < 0 {
+					return fmt.Errorf("gateway_hooks.events.%s[%d].handlers[%d].timeout_seconds must be non-negative (got %d)", eventName, i, j, handler.TimeoutSeconds)
+				}
+				switch strings.TrimSpace(handler.FailureMode) {
+				case "", "fail_closed", "fail_open":
+				default:
+					return fmt.Errorf("gateway_hooks.events.%s[%d].handlers[%d].failure_mode must be empty, fail_closed, or fail_open (got %q)", eventName, i, j, handler.FailureMode)
+				}
+				if secretEnv := strings.TrimSpace(handler.SecretEnv); secretEnv != "" && strings.TrimSpace(os.Getenv(secretEnv)) == "" {
+					return fmt.Errorf("gateway_hooks.events.%s[%d].handlers[%d].secret_env %q is set but environment variable is empty", eventName, i, j, secretEnv)
+				}
+			}
+		}
+	}
+	return nil
+}
+
 // inheritLLMDefaults fills empty fields in sub with the shared LLM-level defaults.
 func inheritLLMDefaults(sub *LLMProviderConfig, shared *LLMConfig) {
 	if sub.Provider == "" {
@@ -986,6 +1068,9 @@ func (c *Config) Validate() error {
 	case "", "observe", "auto", "strict":
 	default:
 		return fmt.Errorf("runtime_policy.autovault_mode must be one of observe, auto, strict (got %q)", c.RuntimePolicy.AutovaultMode)
+	}
+	if err := c.GatewayHooks.Validate(); err != nil {
+		return err
 	}
 	return nil
 }
