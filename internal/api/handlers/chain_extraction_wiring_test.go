@@ -19,13 +19,14 @@ import (
 // fact stamped with the request's TaskID/SessionID so the store assertions
 // reflect what would actually land in chain_facts.
 type recordingExtractor struct {
-	mu              sync.Mutex
-	builtinCalls    int
-	llmCalls        int
-	builtinFactType string
-	builtinValue    string
-	llmFactType     string
-	llmValue        string
+	mu                sync.Mutex
+	builtinCalls      int
+	llmCalls          int
+	builtinFactType   string
+	builtinValue      string
+	lastBuiltinResult string
+	llmFactType       string
+	llmValue          string
 	// done is closed when ExtractBuiltins is called for the first time so
 	// tests can synchronize on the async goroutine without sleeping.
 	done chan struct{}
@@ -44,6 +45,7 @@ func newRecordingExtractor() *recordingExtractor {
 func (r *recordingExtractor) ExtractBuiltins(req intent.ExtractRequest) []*store.ChainFact {
 	r.mu.Lock()
 	r.builtinCalls++
+	r.lastBuiltinResult = req.Result
 	r.mu.Unlock()
 	select {
 	case r.done <- struct{}{}:
@@ -91,6 +93,12 @@ func (r *recordingExtractor) llmCallCount() int {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	return r.llmCalls
+}
+
+func (r *recordingExtractor) lastBuiltinResultValue() string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.lastBuiltinResult
 }
 
 // waitForExtraction polls until ExtractBuiltins has been called at least once
@@ -298,10 +306,10 @@ func TestChainExtraction_Gateway_BuiltinsOnlyMode_SkipsLLM(t *testing.T) {
 type approvalTestStore struct {
 	*localTestStore
 
-	paMu     sync.Mutex
-	pa       *store.PendingApproval
-	claimed  bool
-	deleted  bool
+	paMu    sync.Mutex
+	pa      *store.PendingApproval
+	claimed bool
+	deleted bool
 }
 
 func newApprovalTestStore() *approvalTestStore {
