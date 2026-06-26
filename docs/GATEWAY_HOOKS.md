@@ -36,7 +36,7 @@ Handler fields:
 
 - `name`: Stable handler name. Included in hook headers, request bodies, and audit metadata.
 - `type`: Only `http` is supported in v1.
-- `url`: HTTP endpoint that receives the hook request.
+- `url`: HTTP endpoint that receives the hook request. Do not put credentials in userinfo or query parameters; Clawvisor rejects those forms.
 - `timeout_seconds`: Per-request timeout. `0` uses the default 10-second timeout. Negative values are invalid.
 - `failure_mode`: `fail_closed`, `fail_open`, or empty. Empty behaves like `fail_closed`.
 - `allow_response_update`: Whether this handler may return `updated_tool_response`.

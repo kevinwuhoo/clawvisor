@@ -55,6 +55,7 @@ func (c *HTTPClient) Call(ctx context.Context, cfg config.GatewayHookHandlerConf
 
 	req, err := http.NewRequestWithContext(reqCtx, http.MethodPost, cfg.URL, bytes.NewReader(body))
 	if err != nil {
+		err = sanitizedHookError(cfg.Name, "request setup")
 		summary.DurationMS = time.Since(start).Milliseconds()
 		summary.Error = err.Error()
 		return HookResponse{}, summary, err
@@ -78,6 +79,7 @@ func (c *HTTPClient) Call(ctx context.Context, cfg config.GatewayHookHandlerConf
 
 	resp, err := c.client.Do(req)
 	if err != nil {
+		err = sanitizedHookError(cfg.Name, "request")
 		summary.DurationMS = time.Since(start).Milliseconds()
 		summary.Error = err.Error()
 		return HookResponse{}, summary, err
@@ -117,6 +119,10 @@ func (c *HTTPClient) Call(ctx context.Context, cfg config.GatewayHookHandlerConf
 	summary.UpdatedToolResponse = hookResp.UpdatedToolResponse != nil
 	summary.Metadata = hookResp.AuditMetadata
 	return hookResp, summary, nil
+}
+
+func sanitizedHookError(name, phase string) error {
+	return fmt.Errorf("hook %q %s failed", name, phase)
 }
 
 func signHookBody(secret, timestamp string, body []byte) string {

@@ -3,6 +3,7 @@ package config
 import (
 	"fmt"
 	"log/slog"
+	"net/url"
 	"os"
 	"strconv"
 	"strings"
@@ -965,6 +966,9 @@ func (g GatewayHooksConfig) Validate() error {
 				if strings.TrimSpace(handler.URL) == "" {
 					return fmt.Errorf("gateway_hooks.events.%s[%d].handlers[%d].url must be set", eventName, i, j)
 				}
+				if err := validateGatewayHookURL(handler.URL); err != nil {
+					return fmt.Errorf("gateway_hooks.events.%s[%d].handlers[%d].url %w", eventName, i, j, err)
+				}
 				if handler.TimeoutSeconds < 0 {
 					return fmt.Errorf("gateway_hooks.events.%s[%d].handlers[%d].timeout_seconds must be non-negative (got %d)", eventName, i, j, handler.TimeoutSeconds)
 				}
@@ -978,6 +982,20 @@ func (g GatewayHooksConfig) Validate() error {
 				}
 			}
 		}
+	}
+	return nil
+}
+
+func validateGatewayHookURL(raw string) error {
+	u, err := url.Parse(strings.TrimSpace(raw))
+	if err != nil || u.Scheme == "" || u.Host == "" {
+		return fmt.Errorf("must be a valid http or https URL")
+	}
+	if u.Scheme != "http" && u.Scheme != "https" {
+		return fmt.Errorf("must use http or https")
+	}
+	if u.User != nil || u.RawQuery != "" {
+		return fmt.Errorf("must not include userinfo or query parameters")
 	}
 	return nil
 }

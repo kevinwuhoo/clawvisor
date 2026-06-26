@@ -6,9 +6,11 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -118,6 +120,37 @@ func TestHTTPHookClientRejectsInvalidJSON(t *testing.T) {
 	if err == nil {
 		t.Fatal("Call returned nil error, want invalid JSON error")
 	}
+}
+
+func TestHTTPHookClientSanitizesTransportError(t *testing.T) {
+	client := NewHTTPClient(&http.Client{Transport: erringRoundTripper{
+		err: errors.New("dial failed for https://hook.example/hook?token=secret-token"),
+	}})
+
+	_, summary, err := client.Call(context.Background(), config.GatewayHookHandlerConfig{
+		Name: "leaky-hook",
+		Type: "http",
+		URL:  "https://hook.example/hook?token=secret-token",
+	}, HookRequest{HookEventName: EventGatewayPostToolCall, HookName: "leaky-hook"})
+	if err == nil {
+		t.Fatal("Call returned nil error, want transport error")
+	}
+	for _, got := range []string{err.Error(), summary.Error} {
+		if strings.Contains(got, "secret-token") || strings.Contains(got, "hook.example") {
+			t.Fatalf("transport error leaked hook URL: %q", got)
+		}
+		if !strings.Contains(got, `hook "leaky-hook" request failed`) {
+			t.Fatalf("transport error = %q, want sanitized hook request failure", got)
+		}
+	}
+}
+
+type erringRoundTripper struct {
+	err error
+}
+
+func (rt erringRoundTripper) RoundTrip(*http.Request) (*http.Response, error) {
+	return nil, rt.err
 }
 
 func readAllForTest(t *testing.T, r io.Reader) []byte {

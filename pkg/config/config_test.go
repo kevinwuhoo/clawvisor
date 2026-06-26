@@ -274,6 +274,39 @@ func TestValidateGatewayHooksRejectsNegativeTimeout(t *testing.T) {
 	}
 }
 
+func TestValidateGatewayHooksRejectsHookURLCredentials(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		url  string
+	}{
+		{name: "query token", url: "http://127.0.0.1:8765/hook?token=secret-token"},
+		{name: "userinfo", url: "http://user:secret@127.0.0.1:8765/hook"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := Default()
+			cfg.GatewayHooks = GatewayHooksConfig{
+				Enabled: true,
+				Events: map[string][]GatewayHookEventConfig{
+					"GatewayPostToolCall": {{
+						Matcher: GatewayHookMatcherConfig{Service: "google.gmail", Action: "get_message"},
+						Handlers: []GatewayHookHandlerConfig{{
+							Name:           "privacy-filter",
+							Type:           "http",
+							URL:            tc.url,
+							TimeoutSeconds: 10,
+						}},
+					}},
+				},
+			}
+
+			err := cfg.Validate()
+			if err == nil || !strings.Contains(err.Error(), "must not include userinfo or query parameters") {
+				t.Fatalf("expected hook URL credential validation error, got %v", err)
+			}
+		})
+	}
+}
+
 func TestValidateGatewayHooksRejectsMissingSecretEnv(t *testing.T) {
 	cfg := Default()
 	cfg.GatewayHooks = GatewayHooksConfig{
