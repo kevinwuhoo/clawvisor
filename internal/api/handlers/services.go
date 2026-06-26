@@ -27,6 +27,7 @@ import (
 	"github.com/clawvisor/clawvisor/internal/callback"
 	"github.com/clawvisor/clawvisor/internal/display"
 	"github.com/clawvisor/clawvisor/internal/events"
+	"github.com/clawvisor/clawvisor/internal/gatewayhooks"
 	"github.com/clawvisor/clawvisor/pkg/adapters"
 	"github.com/clawvisor/clawvisor/pkg/adapters/mcpadapter"
 	"github.com/clawvisor/clawvisor/pkg/adapters/yamldef"
@@ -50,6 +51,8 @@ type ServicesHandler struct {
 	// relayDaemonURL is the public HTTPS URL via the relay (e.g. "https://relay.clawvisor.com/d/DAEMON_ID").
 	// Used as redirect_uri for PKCE flows that require HTTPS. Empty when relay is not configured.
 	relayDaemonURL string
+
+	postToolCallHooks gatewayhooks.PostToolCallRunner
 }
 
 type oauthStateEntry struct {
@@ -70,6 +73,10 @@ type oauthStateEntry struct {
 }
 
 var errEmptyAccessToken = errors.New("oauth token response missing access token")
+
+func (h *ServicesHandler) SetPostToolCallHookRunner(r gatewayhooks.PostToolCallRunner) {
+	h.postToolCallHooks = r
+}
 
 // originFromRequest returns the browser origin that initiated the request
 // (e.g. "https://app.clawvisor.com"). Prefers the Origin header (always
@@ -1529,6 +1536,25 @@ func (h *ServicesHandler) reactivatePendingRequest(ctx context.Context, userID, 
 	result, execErr := executeAdapterRequest(ctx, h.vault, h.adapterReg, h.st,
 		userID, blob.Service, blob.Action, blob.Params, vKey)
 
+	if execErr == nil {
+		var hookErr error
+		result, _, hookErr = applyPostToolCallHooks(ctx, h.postToolCallHooks, h.st, postToolCallHookInput{
+			RequestID: requestID,
+			AuditID:   pa.AuditID,
+			UserID:    userID,
+			AgentID:   blob.AgentID,
+			TaskID:    blob.TaskID,
+			SessionID: blob.SessionID,
+			Service:   blob.Service,
+			Action:    blob.Action,
+			Params:    blob.Params,
+			Reason:    blob.Reason,
+		}, result)
+		if hookErr != nil {
+			execErr = hookErr
+		}
+	}
+
 	outcome := "executed"
 	errMsg := ""
 	if execErr != nil {
@@ -1554,6 +1580,7 @@ func (h *ServicesHandler) reactivatePendingRequest(ctx context.Context, userID, 
 			RequestID: requestID,
 			Status:    outcome,
 			Result:    cbResult,
+			Error:     errMsg,
 			AuditID:   pa.AuditID,
 		}, cbKey)
 	}
