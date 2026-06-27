@@ -25,6 +25,23 @@ services:
                     "secret_env": "CLAWVISOR_PRIVACY_FILTER_HOOK_SECRET"
                   }
                 ]
+              },
+              {
+                "matcher": {
+                  "service": "sql",
+                  "action": "query"
+                },
+                "handlers": [
+                  {
+                    "name": "privacy-filter",
+                    "type": "http",
+                    "url": "http://host.docker.internal:8765/v1/hooks/gateway/post-tool-call",
+                    "timeout_seconds": 120,
+                    "failure_mode": "fail_closed",
+                    "allow_response_update": true,
+                    "secret_env": "CLAWVISOR_PRIVACY_FILTER_HOOK_SECRET"
+                  }
+                ]
               }
             ]
           }
