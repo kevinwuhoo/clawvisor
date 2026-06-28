@@ -330,7 +330,16 @@ func TestEvaluateAuthorization_PreferredTaskDisambiguatesServiceAction(t *testin
 	}
 }
 
-func TestEvaluateAuthorization_IgnoresPreferredTaskOutsideCandidateSet(t *testing.T) {
+// TestEvaluateAuthorization_StalePreferredBlocksInsteadOfSiblingMatch
+// pins per-conversation isolation against the stale-checkout case:
+// when PreferredTaskID points at a task that's no longer in the
+// active candidate set (expired, completed, never existed), the
+// pre-fix behavior fell through to the full-pool match and could
+// silently authorize the call via a SIBLING task that happened to
+// cover the action. Strict mode: blocks with
+// SourceTaskScopeMismatchPreferred so the agent must re-checkout
+// explicitly rather than implicitly switch authorization target.
+func TestEvaluateAuthorization_StalePreferredBlocksInsteadOfSiblingMatch(t *testing.T) {
 	got, err := EvaluateAuthorization(context.Background(), AuthorizationInput{
 		ToolUse:         toolUse("WebFetch", map[string]any{"url": "https://api.github.com/repos/acme/app/issues"}),
 		AgentID:         "agent-1",
@@ -342,8 +351,11 @@ func TestEvaluateAuthorization_IgnoresPreferredTaskOutsideCandidateSet(t *testin
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got.Kind != VerdictNeedsApproval || got.Source != SourceTaskScopeAmbiguous {
-		t.Fatalf("decision = %+v, want ambiguity when preferred task is not a valid candidate", got)
+	if got.Kind != VerdictNeedsApproval || got.Source != SourceTaskScopeMismatchPreferred {
+		t.Fatalf("decision = %+v, want SourceTaskScopeMismatchPreferred (no silent sibling match)", got)
+	}
+	if got.Task != nil {
+		t.Fatalf("task = %+v, want nil (sibling MUST NOT authorize the call)", got.Task)
 	}
 }
 
@@ -600,6 +612,56 @@ func TestEvaluateAuthorization_GenuineNoRationaleHarnessUsesSentinel(t *testing.
 	}
 	if verifier.last.Reason != NoPerCallReasonSentinel {
 		t.Fatalf("Reason = %q, want NoPerCallReasonSentinel for argv-only Codex shell", verifier.last.Reason)
+	}
+}
+
+// TestEvaluateAuthorization_PreferredTaskMismatchBlocks pins the
+// per-conversation isolation invariant at the decision-engine layer:
+// when PreferredTaskID is set and the preferred task does not cover
+// the call, the verdict's Source must be SourceTaskScopeMismatchPreferred
+// rather than falling through to a sibling task. This is the
+// regression that was the original leak.
+func TestEvaluateAuthorization_PreferredTaskMismatchBlocks(t *testing.T) {
+	agentID := "agent-1"
+	preferred := taskWithExpectedTool("task-preferred", agentID, "exec_command", "preferred work")
+	sibling := taskWithExpectedTool("task-sibling", agentID, "read_file", "sibling work")
+	got, err := EvaluateAuthorization(context.Background(), AuthorizationInput{
+		ToolUse:         toolUse("read_file", map[string]any{"path": "/etc/hosts"}),
+		AgentID:         agentID,
+		CandidateTasks:  []*store.Task{preferred, sibling},
+		PreferredTaskID: "task-preferred",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Source != SourceTaskScopeMismatchPreferred {
+		t.Fatalf("source = %q, want %q (sibling should NOT have authorized the call)", got.Source, SourceTaskScopeMismatchPreferred)
+	}
+	if got.Kind != VerdictNeedsApproval {
+		t.Fatalf("kind = %v, want VerdictNeedsApproval (preferred-mismatch should block, not allow via sibling)", got.Kind)
+	}
+	if got.Task != nil {
+		t.Fatalf("task should be nil (no sibling match); got %+v", got.Task)
+	}
+}
+
+// TestEvaluateAuthorization_NoPreferredFallsThroughToMissing confirms
+// the no-checkout path is unchanged: with no PreferredTaskID, a
+// no-match still produces SourceTaskScopeMissing (not the new
+// mismatch source). This pins that brand-new conversations get the
+// existing approval-required path rather than the new block class.
+func TestEvaluateAuthorization_NoPreferredFallsThroughToMissing(t *testing.T) {
+	agentID := "agent-1"
+	got, err := EvaluateAuthorization(context.Background(), AuthorizationInput{
+		ToolUse:        toolUse("read_file", map[string]any{"path": "/etc/hosts"}),
+		AgentID:        agentID,
+		CandidateTasks: []*store.Task{taskWithExpectedTool("task-1", agentID, "exec_command", "other work")},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Source != SourceTaskScopeMissing {
+		t.Fatalf("source = %q, want %q", got.Source, SourceTaskScopeMissing)
 	}
 }
 

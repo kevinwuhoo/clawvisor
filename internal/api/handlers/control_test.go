@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/clawvisor/clawvisor/internal/runtime/llmproxy"
+	"github.com/clawvisor/clawvisor/internal/runtime/llmproxy/inspector"
 	"github.com/clawvisor/clawvisor/pkg/store"
 	"github.com/clawvisor/clawvisor/pkg/store/sqlite"
 )
@@ -154,7 +155,7 @@ func TestControlListTasksReturnsAgentActiveTasksAndCheckout(t *testing.T) {
 	}
 
 	checkouts := llmproxy.NewMemoryTaskCheckoutStore(time.Hour)
-	if err := checkouts.Set(ctx, llmproxy.TaskCheckoutKey{UserID: user.ID, AgentID: agent.ID}, "task-active", time.Hour); err != nil {
+	if err := checkouts.Set(ctx, llmproxy.TaskCheckoutKey{UserID: user.ID, AgentID: agent.ID, ConversationID: "conv-1"}, "task-active", time.Hour); err != nil {
 		t.Fatalf("checkout.Set: %v", err)
 	}
 	h := &LLMControlHandler{
@@ -163,6 +164,7 @@ func TestControlListTasksReturnsAgentActiveTasksAndCheckout(t *testing.T) {
 		TaskCheckouts: checkouts,
 	}
 	req := httptest.NewRequest(http.MethodGet, "/api/control/tasks", nil)
+	req.Header.Set(inspector.ConversationIDHeader, "conv-1")
 	req = req.WithContext(store.WithAgent(req.Context(), agent))
 	res := httptest.NewRecorder()
 
@@ -198,6 +200,36 @@ func TestControlListTasksReturnsAgentActiveTasksAndCheckout(t *testing.T) {
 	}
 	if !strings.Contains(payload.NextStep, "/control/task/checkout") {
 		t.Fatalf("expected checkout guidance, got %q", payload.NextStep)
+	}
+}
+
+// TestTrustedConversationID_PrefersLastHeader pins the per-conversation
+// isolation invariant against a header-spoofing attack: the lite-proxy
+// rewriter appends `-H 'X-Clawvisor-Conversation-ID: <id>'` after the
+// agent's curl tokens, so when an agent emits a curl that already
+// includes the header, the resulting HTTP request carries two values.
+// http.Header.Get returned the FIRST (the agent's spoof), which let
+// an agent impersonate any conversation it could guess the id of.
+// Reading the LAST value trusts only the rewriter-appended one.
+func TestTrustedConversationID_PrefersLastHeader(t *testing.T) {
+	req := httptest.NewRequest(http.MethodGet, "/api/control/tasks", nil)
+	req.Header.Add(inspector.ConversationIDHeader, "  spoofed-by-agent  ")
+	req.Header.Add(inspector.ConversationIDHeader, "real-from-rewriter")
+	if got := trustedConversationID(req); got != "real-from-rewriter" {
+		t.Errorf("trustedConversationID = %q, want %q (must take LAST header value, not first)", got, "real-from-rewriter")
+	}
+
+	// Single-value (the only-rewriter case) round-trips with trimming.
+	clean := httptest.NewRequest(http.MethodGet, "/", nil)
+	clean.Header.Set(inspector.ConversationIDHeader, "  conv-1  ")
+	if got := trustedConversationID(clean); got != "conv-1" {
+		t.Errorf("trustedConversationID single value = %q, want %q", got, "conv-1")
+	}
+
+	// Empty when header absent.
+	empty := httptest.NewRequest(http.MethodGet, "/", nil)
+	if got := trustedConversationID(empty); got != "" {
+		t.Errorf("trustedConversationID with no header = %q, want empty", got)
 	}
 }
 
