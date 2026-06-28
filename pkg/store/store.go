@@ -134,6 +134,7 @@ type Store interface {
 	// unique index.
 	LogAudit(ctx context.Context, entry *AuditEntry) error
 	UpdateAuditOutcome(ctx context.Context, id, outcome, errMsg string, durationMS int) error
+	UpdateAuditFiltersApplied(ctx context.Context, id string, filters json.RawMessage) error
 	GetAuditEntry(ctx context.Context, id, userID string) (*AuditEntry, error)
 	// GetAuditEntryByRequestID returns the latest request-level canonical audit
 	// entry for (request_id, user_id). Used by the polling endpoint and other

@@ -16,6 +16,7 @@ import (
 	"github.com/clawvisor/clawvisor/internal/api/middleware"
 	"github.com/clawvisor/clawvisor/internal/callback"
 	"github.com/clawvisor/clawvisor/internal/events"
+	"github.com/clawvisor/clawvisor/internal/gatewayhooks"
 	"github.com/clawvisor/clawvisor/internal/runtime/llmproxy"
 	"github.com/clawvisor/clawvisor/internal/taskrisk"
 	"github.com/clawvisor/clawvisor/pkg/adapters"
@@ -27,15 +28,16 @@ import (
 
 // ApprovalsHandler manages pending approval decisions.
 type ApprovalsHandler struct {
-	st         store.Store
-	vault      vault.Vault
-	adapterReg *adapters.Registry
-	notifier   notify.Notifier // may be nil
-	cfg        config.Config
-	assessor   taskrisk.Assessor
-	logger     *slog.Logger
-	eventHub   events.EventHub
-	cbDispatch *CallbackDispatcher // bounded callback delivery; may be nil (falls back to inline panic-safe goroutines)
+	st                store.Store
+	vault             vault.Vault
+	adapterReg        *adapters.Registry
+	notifier          notify.Notifier // may be nil
+	cfg               config.Config
+	assessor          taskrisk.Assessor
+	logger            *slog.Logger
+	eventHub          events.EventHub
+	cbDispatch        *CallbackDispatcher // bounded callback delivery; may be nil (falls back to inline panic-safe goroutines)
+	postToolCallHooks gatewayhooks.PostToolCallRunner
 }
 
 func NewApprovalsHandler(st store.Store, v vault.Vault, adapterReg *adapters.Registry, notifier notify.Notifier, cfg config.Config, assessor taskrisk.Assessor, logger *slog.Logger, eventHub events.EventHub) *ApprovalsHandler {
@@ -56,6 +58,10 @@ func NewApprovalsHandler(st store.Store, v vault.Vault, adapterReg *adapters.Reg
 // inline goroutine — still panic-safe but with no concurrency cap.
 func (h *ApprovalsHandler) SetCallbackDispatcher(d *CallbackDispatcher) {
 	h.cbDispatch = d
+}
+
+func (h *ApprovalsHandler) SetPostToolCallHookRunner(r gatewayhooks.PostToolCallRunner) {
+	h.postToolCallHooks = r
 }
 
 // dispatchCallback enqueues a payload for delivery via the bounded
@@ -529,6 +535,25 @@ func (h *ApprovalsHandler) executeApproval(ctx context.Context, pa *store.Pendin
 	result, execErr := executeAdapterRequest(ctx, h.vault, h.adapterReg, h.st,
 		pa.UserID, blob.Service, blob.Action, blob.Params, vKey)
 	dur := int(time.Since(start).Milliseconds())
+
+	if execErr == nil {
+		var hookErr error
+		result, _, hookErr = applyPostToolCallHooks(ctx, h.postToolCallHooks, h.st, postToolCallHookInput{
+			RequestID: pa.RequestID,
+			AuditID:   pa.AuditID,
+			UserID:    pa.UserID,
+			AgentID:   blob.AgentID,
+			TaskID:    blob.TaskID,
+			SessionID: blob.SessionID,
+			Service:   blob.Service,
+			Action:    blob.Action,
+			Params:    blob.Params,
+			Reason:    blob.Reason,
+		}, result)
+		if hookErr != nil {
+			execErr = hookErr
+		}
+	}
 
 	outcome := "executed"
 	errMsg := ""

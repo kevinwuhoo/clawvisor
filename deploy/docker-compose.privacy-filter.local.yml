@@ -1,0 +1,48 @@
+services:
+  app:
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    environment:
+      CLAWVISOR_PRIVACY_FILTER_HOOK_SECRET: "${CLAWVISOR_PRIVACY_FILTER_HOOK_SECRET:?set CLAWVISOR_PRIVACY_FILTER_HOOK_SECRET}"
+      CLAWVISOR_GATEWAY_HOOKS_JSON: |
+        {
+          "enabled": true,
+          "events": {
+            "GatewayPostToolCall": [
+              {
+                "matcher": {
+                  "service": "google.gmail",
+                  "action": "get_message|list_messages"
+                },
+                "handlers": [
+                  {
+                    "name": "privacy-filter",
+                    "type": "http",
+                    "url": "http://host.docker.internal:8765/v1/hooks/gateway/post-tool-call",
+                    "timeout_seconds": 120,
+                    "failure_mode": "fail_closed",
+                    "allow_response_update": true,
+                    "secret_env": "CLAWVISOR_PRIVACY_FILTER_HOOK_SECRET"
+                  }
+                ]
+              },
+              {
+                "matcher": {
+                  "service": "sql",
+                  "action": "query"
+                },
+                "handlers": [
+                  {
+                    "name": "privacy-filter",
+                    "type": "http",
+                    "url": "http://host.docker.internal:8765/v1/hooks/gateway/post-tool-call",
+                    "timeout_seconds": 120,
+                    "failure_mode": "fail_closed",
+                    "allow_response_update": true,
+                    "secret_env": "CLAWVISOR_PRIVACY_FILTER_HOOK_SECRET"
+                  }
+                ]
+              }
+            ]
+          }
+        }

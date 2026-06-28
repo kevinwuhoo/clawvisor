@@ -21,6 +21,7 @@ import (
 	intauth "github.com/clawvisor/clawvisor/internal/auth"
 	"github.com/clawvisor/clawvisor/internal/events"
 	"github.com/clawvisor/clawvisor/internal/feedback"
+	"github.com/clawvisor/clawvisor/internal/gatewayhooks"
 	"github.com/clawvisor/clawvisor/internal/groupchat"
 	"github.com/clawvisor/clawvisor/internal/intent"
 	"github.com/clawvisor/clawvisor/internal/llm"
@@ -83,14 +84,15 @@ type Server struct {
 	llmVerifier        *intent.LLMVerifier          // verdict cache cleanup target; nil when verification disabled
 	cbDispatcher       *handlers.CallbackDispatcher // bounded callback delivery pool
 
-	pushNotifier         *push.Notifier                // concrete push notifier; may be nil
-	msgBuffer            groupchat.Buffer              // group chat message buffer; may be nil
-	decisionBus          notify.DecisionBus            // cross-instance decision delivery; may be nil
-	gatewayHooks         *GatewayHooks                 // cloud-injected gateway authorization hooks; may be nil
-	feedbackHooks        *FeedbackHooks                // cloud-injected feedback event hooks; may be nil
-	featuresHook         FeaturesHook                  // cloud-injected per-user feature overrides; may be nil
-	localServiceProvider handlers.LocalServiceProvider // cloud-injected local daemon service provider; may be nil
-	localServiceExecutor handlers.LocalServiceExecutor // cloud-injected local service executor; may be nil
+	pushNotifier             *push.Notifier     // concrete push notifier; may be nil
+	msgBuffer                groupchat.Buffer   // group chat message buffer; may be nil
+	decisionBus              notify.DecisionBus // cross-instance decision delivery; may be nil
+	gatewayHooks             *GatewayHooks      // cloud-injected gateway authorization hooks; may be nil
+	gatewayPostToolCallHooks gatewayhooks.PostToolCallRunner
+	feedbackHooks            *FeedbackHooks                // cloud-injected feedback event hooks; may be nil
+	featuresHook             FeaturesHook                  // cloud-injected per-user feature overrides; may be nil
+	localServiceProvider     handlers.LocalServiceProvider // cloud-injected local daemon service provider; may be nil
+	localServiceExecutor     handlers.LocalServiceExecutor // cloud-injected local service executor; may be nil
 
 	eventHub    events.EventHub
 	mcpServer   *mcp.Server
@@ -455,6 +457,10 @@ func New(
 		s.logger = slog.New(slog.NewTextHandler(io.Discard, nil))
 	}
 
+	if cfg.GatewayHooks.Enabled {
+		s.gatewayPostToolCallHooks = gatewayhooks.NewRunner(cfg.GatewayHooks, nil)
+	}
+
 	mux := s.routes()
 
 	s.http = &http.Server{
@@ -559,6 +565,9 @@ func (s *Server) routes() http.Handler {
 		s.notifier, verifier, extractor, *s.cfg, s.logger, baseURL, s.eventHub,
 	)
 	gatewayHandler.SetCallbackDispatcher(s.cbDispatcher)
+	if s.gatewayPostToolCallHooks != nil {
+		gatewayHandler.SetPostToolCallHookRunner(s.gatewayPostToolCallHooks)
+	}
 	if s.llmCfg.Verification.Enabled {
 		gatewayHandler.SetGatewayRequestResolver(runtimepolicy.NewLLMGatewayRequestResolver(s.llmHealth, s.logger))
 	}
@@ -577,6 +586,9 @@ func (s *Server) routes() http.Handler {
 		gatewayHandler.SetLocalServiceProvider(s.localServiceProvider)
 	}
 	servicesHandler := handlers.NewServicesHandler(s.store, s.vault, s.adapterReg, s.logger, baseURL, s.eventHub)
+	if s.gatewayPostToolCallHooks != nil {
+		servicesHandler.SetPostToolCallHookRunner(s.gatewayPostToolCallHooks)
+	}
 	vaultHandler := handlers.NewVaultHandler(s.store, s.vault, s.adapterReg)
 	if s.oauthStateStore != nil {
 		servicesHandler.SetOAuthStateStore(s.oauthStateStore)
@@ -602,6 +614,9 @@ func (s *Server) routes() http.Handler {
 	s.taskRiskAssessor = assessor
 	approvalsHandler := handlers.NewApprovalsHandler(s.store, s.vault, s.adapterReg, s.notifier, *s.cfg, assessor, s.logger, s.eventHub)
 	approvalsHandler.SetCallbackDispatcher(s.cbDispatcher)
+	if s.gatewayPostToolCallHooks != nil {
+		approvalsHandler.SetPostToolCallHookRunner(s.gatewayPostToolCallHooks)
+	}
 	s.approvalsHandler = approvalsHandler
 
 	tasksHandler := handlers.NewTasksHandler(s.store, s.vault, s.adapterReg,

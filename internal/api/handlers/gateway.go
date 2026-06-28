@@ -19,6 +19,7 @@ import (
 	"github.com/clawvisor/clawvisor/internal/auth"
 	"github.com/clawvisor/clawvisor/internal/callback"
 	"github.com/clawvisor/clawvisor/internal/events"
+	"github.com/clawvisor/clawvisor/internal/gatewayhooks"
 	"github.com/clawvisor/clawvisor/internal/intent"
 	"github.com/clawvisor/clawvisor/internal/ratelimit"
 	runtimepolicy "github.com/clawvisor/clawvisor/internal/runtime/policy"
@@ -71,24 +72,25 @@ func isLocalService(serviceType string) bool {
 
 // GatewayHandler handles POST /api/gateway/request.
 type GatewayHandler struct {
-	store            store.Store
-	vault            vault.Vault
-	adapterReg       *adapters.Registry
-	notifier         notify.Notifier // may be nil if Telegram not configured
-	verifier         intent.Verifier
-	extractor        intent.Extractor
-	extractTrack     ExtractionTracker // tracks in-flight async extractions; never nil
-	cfg              config.Config
-	logger           *slog.Logger
-	baseURL          string
-	eventHub         events.EventHub
-	requestResolver  runtimepolicy.GatewayRequestResolver
-	gatewayHooks     *GatewayHooks        // cloud-injected authorization hooks; may be nil
-	localExec        LocalServiceExecutor // cloud-injected local service executor; may be nil
-	localSvcProvider LocalServiceProvider // cloud-injected local service catalog; may be nil
-	cbDispatch       *CallbackDispatcher  // bounded callback delivery; may be nil
-	gatewayRL        ratelimit.Limiter    // gateway-bucket limiter for per-sub-request charging in HandleBatch; may be nil
-	gatewayRLKey     func(*http.Request) string
+	store             store.Store
+	vault             vault.Vault
+	adapterReg        *adapters.Registry
+	notifier          notify.Notifier // may be nil if Telegram not configured
+	verifier          intent.Verifier
+	extractor         intent.Extractor
+	extractTrack      ExtractionTracker // tracks in-flight async extractions; never nil
+	cfg               config.Config
+	logger            *slog.Logger
+	baseURL           string
+	eventHub          events.EventHub
+	requestResolver   runtimepolicy.GatewayRequestResolver
+	gatewayHooks      *GatewayHooks // cloud-injected authorization hooks; may be nil
+	postToolCallHooks gatewayhooks.PostToolCallRunner
+	localExec         LocalServiceExecutor // cloud-injected local service executor; may be nil
+	localSvcProvider  LocalServiceProvider // cloud-injected local service catalog; may be nil
+	cbDispatch        *CallbackDispatcher  // bounded callback delivery; may be nil
+	gatewayRL         ratelimit.Limiter    // gateway-bucket limiter for per-sub-request charging in HandleBatch; may be nil
+	gatewayRLKey      func(*http.Request) string
 }
 
 func NewGatewayHandler(
@@ -127,6 +129,10 @@ func (h *GatewayHandler) SetGatewayHooks(hooks *GatewayHooks) {
 	h.gatewayHooks = hooks
 }
 
+func (h *GatewayHandler) SetPostToolCallHookRunner(r gatewayhooks.PostToolCallRunner) {
+	h.postToolCallHooks = r
+}
+
 func (h *GatewayHandler) SetGatewayRequestResolver(resolver runtimepolicy.GatewayRequestResolver) {
 	h.requestResolver = resolver
 }
@@ -156,6 +162,73 @@ func (h *GatewayHandler) SetCallbackDispatcher(d *CallbackDispatcher) {
 func (h *GatewayHandler) SetGatewayRateLimiter(limiter ratelimit.Limiter, agentKey func(*http.Request) string) {
 	h.gatewayRL = limiter
 	h.gatewayRLKey = agentKey
+}
+
+type postToolCallHookInput struct {
+	RequestID string
+	AuditID   string
+	UserID    string
+	AgentID   string
+	TaskID    string
+	SessionID string
+	Service   string
+	Action    string
+	Params    map[string]any
+	Reason    string
+}
+
+func applyPostToolCallHooks(
+	ctx context.Context,
+	runner gatewayhooks.PostToolCallRunner,
+	st store.Store,
+	in postToolCallHookInput,
+	result *adapters.Result,
+) (*adapters.Result, bool, error) {
+	if runner == nil || result == nil {
+		return result, false, nil
+	}
+
+	out, err := runner.RunPostToolCall(ctx, gatewayhooks.PostToolCallEvent{
+		RequestID:    in.RequestID,
+		AuditID:      in.AuditID,
+		UserID:       in.UserID,
+		AgentID:      in.AgentID,
+		TaskID:       in.TaskID,
+		SessionID:    in.SessionID,
+		Service:      in.Service,
+		Action:       in.Action,
+		Params:       in.Params,
+		Reason:       in.Reason,
+		ToolResponse: result,
+	})
+	if err != nil {
+		var hookErr *gatewayhooks.HookError
+		if errors.As(err, &hookErr) {
+			if len(hookErr.FiltersApplied) > 0 && st != nil {
+				_ = st.UpdateAuditFiltersApplied(context.WithoutCancel(ctx), in.AuditID, hookErr.FiltersApplied)
+			}
+			return result, hookErr.SkipChainExtraction, err
+		}
+		return result, true, err
+	}
+	if out == nil {
+		return result, false, nil
+	}
+	if len(out.FiltersApplied) > 0 && st != nil {
+		_ = st.UpdateAuditFiltersApplied(context.WithoutCancel(ctx), in.AuditID, out.FiltersApplied)
+	}
+	if out.ToolResponse != nil {
+		result = out.ToolResponse
+	}
+	return result, out.SkipChainExtraction, nil
+}
+
+func hookGatewayErrorCode(err error) string {
+	var hookErr *gatewayhooks.HookError
+	if errors.As(err, &hookErr) && hookErr.Code == gatewayhooks.ErrorCodeHookBlocked {
+		return gateway.CodeHookBlocked
+	}
+	return gateway.CodeHookFailed
 }
 
 // dispatchCallback enqueues a payload for delivery via the bounded
@@ -1084,6 +1157,28 @@ func (h *GatewayHandler) HandleRequest(w http.ResponseWriter, r *http.Request) {
 			finalizeCtx, finalizeCancel := context.WithTimeout(context.Background(), 5*time.Second)
 			defer finalizeCancel()
 
+			skipChainExtraction := false
+			hookExecErr := false
+			if execErr == nil {
+				var hookErr error
+				result, skipChainExtraction, hookErr = applyPostToolCallHooks(ctx, h.postToolCallHooks, h.store, postToolCallHookInput{
+					RequestID: req.RequestID,
+					AuditID:   auditID,
+					UserID:    agent.UserID,
+					AgentID:   agent.ID,
+					TaskID:    req.TaskID,
+					SessionID: req.SessionID,
+					Service:   req.Service,
+					Action:    req.Action,
+					Params:    req.Params,
+					Reason:    req.Reason,
+				}, result)
+				if hookErr != nil {
+					execErr = hookErr
+					hookExecErr = true
+				}
+			}
+
 			if execErr != nil {
 				errMsg := execErr.Error()
 				if updErr := h.store.UpdateAuditOutcome(finalizeCtx, auditID, "error", errMsg, dur); updErr != nil {
@@ -1103,6 +1198,9 @@ func (h *GatewayHandler) HandleRequest(w http.ResponseWriter, r *http.Request) {
 					"audit_id":   auditID,
 					"error":      errMsg,
 					"code":       gateway.CodeAdapterError,
+				}
+				if hookExecErr {
+					resp["code"] = hookGatewayErrorCode(execErr)
 				}
 				h.maybeInjectNPS(ctx, resp, agent.ID)
 				writeJSON(w, http.StatusOK, resp)
@@ -1124,8 +1222,10 @@ func (h *GatewayHandler) HandleRequest(w http.ResponseWriter, r *http.Request) {
 			// verifier's extract_context flag (false for creates/sends per
 			// the prompt) to keep cost bounded.
 			runLLM := verdict != nil && verdict.ExtractContext
-			h.startChainExtraction(task, req.Service, req.Action, result,
-				req.TaskID, req.SessionID, auditID, runLLM)
+			if !skipChainExtraction {
+				h.startChainExtraction(task, req.Service, req.Action, result,
+					req.TaskID, req.SessionID, auditID, runLLM)
+			}
 
 			if req.Context.CallbackURL != "" {
 				cbKey, _ := h.store.GetAgentCallbackSecret(ctx, agent.ID)
@@ -1556,6 +1656,28 @@ func (h *GatewayHandler) executeAndRespond(w http.ResponseWriter, ctx context.Co
 	}
 	dur := int(time.Since(start).Milliseconds())
 
+	skipChainExtraction := false
+	hookErrorCode := ""
+	if execErr == nil {
+		var hookErr error
+		result, skipChainExtraction, hookErr = applyPostToolCallHooks(ctx, h.postToolCallHooks, h.store, postToolCallHookInput{
+			RequestID: pa.RequestID,
+			AuditID:   pa.AuditID,
+			UserID:    pa.UserID,
+			AgentID:   agentID,
+			TaskID:    blob.TaskID,
+			SessionID: blob.SessionID,
+			Service:   blob.Service,
+			Action:    blob.Action,
+			Params:    blob.Params,
+			Reason:    blob.Reason,
+		}, result)
+		if hookErr != nil {
+			execErr = hookErr
+			hookErrorCode = hookGatewayErrorCode(hookErr)
+		}
+	}
+
 	outcome := "executed"
 	errMsg := ""
 	if execErr != nil {
@@ -1572,7 +1694,7 @@ func (h *GatewayHandler) executeAndRespond(w http.ResponseWriter, ctx context.Co
 	// auto-execute path does this inline; without the call here, a "create"
 	// approved through the per-request flow would never reach the extractor
 	// and the next "update_*" request would fail chain verification.
-	if execErr == nil && blob.TaskID != "" {
+	if execErr == nil && !skipChainExtraction && blob.TaskID != "" {
 		var task *store.Task
 		if t, err := h.store.GetTask(ctx, blob.TaskID); err == nil {
 			task = t
@@ -1589,6 +1711,9 @@ func (h *GatewayHandler) executeAndRespond(w http.ResponseWriter, ctx context.Co
 	}
 	if execErr != nil {
 		resp["error"] = errMsg
+		if hookErrorCode != "" {
+			resp["code"] = hookErrorCode
+		}
 	} else {
 		resp["result"] = result
 	}
